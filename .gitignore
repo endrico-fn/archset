@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Local installer logs and upstream reference clones (private / not part of the tool)
+archinstall/
+reference/
+*.log
+*.bak
+*.old
