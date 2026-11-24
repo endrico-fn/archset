@@ -48,7 +48,28 @@ SYSTEM_STATIC_FILES: list[tuple[str, str, int]] = [
     ("etc/modprobe.d/rtw88_powersave.conf", "/etc/modprobe.d/rtw88_powersave.conf", 0o644),
     ("etc/modprobe.d/usb_powersave.conf", "/etc/modprobe.d/usb_powersave.conf", 0o644),
     ("etc/modprobe.d/blacklist-unused.conf", "/etc/modprobe.d/blacklist-unused.conf", 0o644),
+    ("etc/initcpio/install/sd-archrelius", "/etc/initcpio/install/sd-archrelius", 0o644),
+    ("usr/local/src/archrelius-askpw.c", "/usr/local/src/archrelius-askpw.c", 0o644),
     ("usr/local/bin/importwgp", "/usr/local/bin/importwgp", 0o755),
+]
+
+ASKPW_SRC_DST = "/usr/local/src/archrelius-askpw.c"
+ASKPW_BIN_DST = "/usr/local/lib/systemd/archrelius-askpw"
+ASKPW_CC_ARGS: list[str] = [
+    "gcc",
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fPIE",
+    "-pie",
+    "-fstack-protector-strong",
+    "-D_FORTIFY_SOURCE=3",
+    "-Wl,-z,relro,-z,now",
+    ASKPW_SRC_DST,
+    "-o",
+    ASKPW_BIN_DST,
 ]
 
 # Bootloader / UKI drop-ins (written in setup_bootloader)

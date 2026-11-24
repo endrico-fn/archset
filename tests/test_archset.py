@@ -4,9 +4,18 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
+import pty
+import select
+import shutil
+import socket
+import struct
+import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -34,8 +43,13 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
         mk_dropin = configs.load_file(configs.MKINITCPIO_DROPIN_SRC)
         self.assertIn("systemd", mk_dropin)
         self.assertIn("sd-encrypt", mk_dropin)
+        self.assertIn("sd-archrelius", mk_dropin)
         self.assertIn("sd-vconsole", mk_dropin)
         self.assertNotIn("udev", mk_dropin)
+
+        sd_hook = configs.load_file("etc/initcpio/install/sd-archrelius")
+        self.assertIn("add_binary /usr/local/lib/systemd/archrelius-askpw", sd_hook)
+        self.assertIn("add_systemd_drop_in systemd-ask-password-console.service", sd_hook)
 
         i915 = configs.load_file("etc/modprobe.d/i915.conf")
         self.assertNotIn("fastboot", i915)
@@ -93,6 +107,7 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
         self.assertIn("vm.mmap_rnd_bits                                                        = 32", sysctl_conf)
         self.assertIn("vm.mmap_rnd_compat_bits                                                 = 16", sysctl_conf)
         self.assertIn("net.ipv4.conf.all.log_martians                                          = 1", sysctl_conf)
+        self.assertIn("net.ipv4.conf.all.drop_unicast_in_l2_multicast                          = 1", sysctl_conf)
         self.assertIn("net.ipv6.conf.all.accept_redirects                                      = 0", sysctl_conf)
 
         wpa_sandbox = configs.load_file(
@@ -158,6 +173,9 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
                 "etc/audit/rules.d/30-archset.rules",
                 "etc/security/limits.d/10-coredump.conf",
                 "etc/modprobe.d/blacklist-unused.conf",
+                "etc/initcpio/install/sd-archrelius",
+                "usr/local/src/archrelius-askpw.c",
+                "usr/local/lib/systemd/archrelius-askpw",
                 "etc/systemd/system/wpa_supplicant.service.d/10-hardening.conf",
                 "etc/systemd/resolved.conf.d/10-dnscrypt.conf",
                 "etc/NetworkManager/dispatcher.d/10-enforce-no-ipv6.sh",
@@ -385,6 +403,107 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
             ui.DRY_RUN = prev_dry_run
 
         self.assertIn("/home/alice/.config/nvim/sudoedit.lua", written_paths)
+
+    @unittest.skipIf(shutil.which("gcc") is None, "gcc not available")
+    def test_archrelius_askpw_c_compiles_with_hardened_flags_and_handles_pty_socket(
+        self,
+    ) -> None:
+        src = configs.file_path("usr/local/src/archrelius-askpw.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "archrelius-askpw"
+            ask_dir = Path(tmp) / "ask-password"
+            ask_dir.mkdir()
+            sck_path = ask_dir / "sck.test"
+            notify_path = Path(tmp) / "notify.sock"
+
+            cc_cmd = [
+                arg
+                if arg not in (configs.ASKPW_SRC_DST, configs.ASKPW_BIN_DST)
+                else (str(src) if arg == configs.ASKPW_SRC_DST else str(bin_path))
+                for arg in configs.ASKPW_CC_ARGS
+            ]
+            subprocess.run(cc_cmd, check=True)
+
+            recv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            recv_sock.bind(str(sck_path))
+            recv_sock.settimeout(5.0)
+
+            notify_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            notify_sock.bind(str(notify_path))
+            notify_sock.settimeout(5.0)
+
+            (ask_dir / "ask.0001").write_text(
+                f"[Ask]\nPID={os.getpid()}\nSocket={sck_path}\n"
+                "Id=cryptsetup:/dev/nvme0n1p2\nMessage=Unlock:\n",
+                encoding="utf-8",
+            )
+
+            master_fd, slave_fd = pty.openpty()
+            # Start at dummycon 160x50 (exact pre-i915 KMS grid), then resize to 170x48!
+            fcntl.ioctl(
+                slave_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", 50, 160, 1280, 800),
+            )
+            env = os.environ.copy()
+            env["NOTIFY_SOCKET"] = str(notify_path)
+
+            proc = subprocess.Popen(
+                [
+                    str(bin_path),
+                    "--query",
+                    f"--tty={os.ttyname(slave_fd)}",
+                    f"--ask-dir={ask_dir}",
+                ],
+                env=env,
+            )
+            try:
+                self.assertEqual(notify_sock.recv(64), b"READY=1\n")
+                # Read initial 160x50 TUI frame (box_col = (160-50)//2 + 1 = 56)
+                rendered = bytearray()
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                    if r:
+                        rendered.extend(os.read(master_fd, 8192))
+                        if "┌─ Enter passphrase for /dev/nvme0n1p2: " in rendered.decode(
+                            "utf-8", "replace"
+                        ):
+                            break
+                text_ui = rendered.decode("utf-8", "replace")
+                self.assertIn("┌─ Enter passphrase for /dev/nvme0n1p2: ─────────┐", text_ui)
+                self.assertIn("\x1b[27;56H┌─", text_ui)
+
+                # Simulate i915drmfb deferred takeover switching console to 170x48 without keypress
+                fcntl.ioctl(
+                    slave_fd,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 48, 170, 1366, 768),
+                )
+                resized_out = bytearray()
+                deadline = time.time() + 1.0
+                expected_resized = "\x1b[26;61H┌─ Enter passphrase for /dev/nvme0n1p2: ─────────┐"
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                    if r:
+                        resized_out.extend(os.read(master_fd, 8192))
+                        if expected_resized in resized_out.decode("utf-8", "replace"):
+                            break
+                self.assertIn(expected_resized, resized_out.decode("utf-8", "replace"))
+
+                # Send passphrase with Backspace + Arrow-Left escape sequence
+                os.write(master_fd, b"SecrX\x7f\x1b[Det#99\n")
+                reply = recv_sock.recv(256)
+                self.assertEqual(reply, b"+Secret#99")
+                self.assertEqual(proc.wait(timeout=3), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                os.close(master_fd)
+                os.close(slave_fd)
+                recv_sock.close()
+                notify_sock.close()
 
 
 if __name__ == "__main__":

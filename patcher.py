@@ -168,7 +168,7 @@ def patch_linux_preset(text: str, *, fallback: bool = True) -> str:
         text = patch_line(
             text,
             r"^#?\s*fallback_options=.*$",
-            'fallback_options="-S autodetect"',
+            'fallback_options="-S autodetect,sd-archrelius"',
             anchor=r"^fallback_uki=.*$",
         )
 

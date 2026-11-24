@@ -109,7 +109,7 @@ fallback_options="-S autodetect"
         self.assertIn(
             'fallback_uki="/boot/EFI/Linux/arch-linux-fallback.efi"', patched
         )
-        self.assertIn('fallback_options="-S autodetect"', patched)
+        self.assertIn('fallback_options="-S autodetect,sd-archrelius"', patched)
         # Idempotent
         self.assertEqual(patched, patcher.patch_linux_preset(patched, fallback=True))
 

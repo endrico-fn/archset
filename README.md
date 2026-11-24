@@ -12,7 +12,7 @@ Opinionated, hardened Arch Linux installer written in Python (stdlib only). Run 
 | Firmware | UEFI only (no Secure Boot, no TPM2) |
 | Partitions | 1 GiB ESP (`/boot`, `fmask=0177,dmask=0077,nodev,nosuid,noexec`) + LUKS2 (`argon2id`, passphrase-only) |
 | Filesystem | Btrfs: `@`, `@home`, `@log`, `@pkg`, `@snapshots`, `@swap` (`zstd:3`) |
-| Boot & UKI | `systemd-boot` (`editor no`, `systemd-boot-update.service`) + UKI via `/etc/mkinitcpio.conf.d/10-archset.conf` (`systemd` + `sd-encrypt`) + `/etc/cmdline.d/` (`10-root`, `20-security`, `30-boot-ui` quiet minimal prompt + `systemd.tpm2_measured_os=0`) |
+| Boot & UKI | `systemd-boot` (`editor no`, `systemd-boot-update.service`) + UKI via `/etc/mkinitcpio.conf.d/10-archset.conf` (`systemd` + `sd-encrypt` + `sd-archrelius` centered `ARCHRELIUS` TUI password agent; fallback UKI keeps stock `systemd` prompt) + `/etc/cmdline.d/` (`10-root`, `20-security`, `30-boot-ui` quiet boot + `systemd.tpm2_measured_os=0`) |
 | Swap | `zram` (`zstd`) + 4 GiB Btrfs swapfile |
 | Network & DNS | IPv6 permanently disabled (`sysctl` + `nftables` + NM dispatcher), `dnscrypt-proxy` (`mullvad-doh` + `quad9-doh-ip4-port443-filter-pri`) + `systemd-resolved`, `wireguard-tools` + `importwgp` |
 | Desktop | KDE Plasma (Wayland, `BreezeDarkMod`, accent `#64beaf`, `ShadowNone`, lightweight KWin, Baloo disabled), GTK3/4 dark, `fontconfig`, `kitty`, `zsh` + `starship` + `fzf-tab` |

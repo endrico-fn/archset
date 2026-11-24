@@ -479,6 +479,13 @@ def setup_bootloader(luks_uuid: str) -> None:
         patcher.patch_loader_conf,
         default_if_missing=configs.LOADER_CONF,
     )
+
+    ui.info("Compiling hardened ARCHRELIUS TUI LUKS password agent")
+    ui.mkdir(target_path("/usr/local/lib/systemd"))
+    chroot(configs.ASKPW_CC_ARGS)
+    chroot(["strip", "--strip-unneeded", configs.ASKPW_BIN_DST])
+    chroot(["chmod", "0755", configs.ASKPW_BIN_DST])
+
     chroot(["mkinitcpio", "-P"])
 
     if not ui.DRY_RUN:
@@ -605,6 +612,9 @@ def verify(username: str) -> None:
         target_path("/etc/audit/rules.d/30-archset.rules"): "auditd security ruleset",
         target_path("/etc/security/limits.d/10-coredump.conf"): "PAM limits core dump disable",
         target_path("/etc/modprobe.d/blacklist-unused.conf"): "unused protocol & FireWire blacklist",
+        target_path("/etc/initcpio/install/sd-archrelius"): "sd-archrelius mkinitcpio TUI hook",
+        target_path(configs.ASKPW_SRC_DST): "archrelius-askpw C source",
+        target_path(configs.ASKPW_BIN_DST): "archrelius-askpw compiled binary",
         target_path(
             "/etc/systemd/system/wpa_supplicant.service.d/10-hardening.conf"
         ): "wpa_supplicant systemd sandbox drop-in",

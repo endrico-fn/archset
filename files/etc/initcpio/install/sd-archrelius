@@ -1,0 +1,25 @@
+#!/bin/bash
+
+build() {
+    if [[ ! -x /usr/local/lib/systemd/archrelius-askpw ]]; then
+        warning "archrelius-askpw binary missing; keeping stock systemd-tty-ask-password-agent"
+        return 0
+    fi
+
+    add_binary /usr/local/lib/systemd/archrelius-askpw
+
+    printf '%s\n' \
+        '[Service]' \
+        'ExecStart=' \
+        'ExecStart=/usr/local/lib/systemd/archrelius-askpw --watch --console' \
+        | add_systemd_drop_in systemd-ask-password-console.service 10-archrelius
+}
+
+help() {
+    cat <<HELPEOF
+This hook installs the centered ARCHRELIUS TUI password agent for sd-encrypt
+inside the initramfs (with automatic fallback to systemd-tty-ask-password-agent).
+HELPEOF
+}
+
+# vim: set ft=sh ts=4 sw=4 et:
