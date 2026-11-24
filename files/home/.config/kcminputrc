@@ -1,0 +1,6 @@
+[Libinput][1739][52560][SYNA3296:00 06CB:CD50 Touchpad]
+NaturalScroll=true
+PointerAcceleration=0.600
+
+[Mouse]
+cursorTheme=Breeze_Light

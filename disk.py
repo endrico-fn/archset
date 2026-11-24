@@ -151,7 +151,16 @@ def is_mounted(disk: str) -> bool:
     return any(walk(node) for node in data.get("blockdevices", []))
 
 
+def assert_no_active_luks(name: str = LUKS_NAME) -> None:
+    mapper = f"/dev/mapper/{name}"
+    if os.path.exists(mapper):
+        raise ui.ArchsetError(
+            f"{mapper} is already active. Close it (cryptsetup close {name}) before installing."
+        )
+
+
 def assert_safe_target(disk: str) -> None:
+    assert_no_active_luks()
     info = next(
         (item for item in list_disks(include_loop=True) if item.path == disk),
         None,
@@ -232,7 +241,7 @@ def mkfs_esp(device: str) -> None:
 
 
 def luks_format(device: str, passphrase: str) -> None:
-    ui.info(f"Creating LUKS2 container on {device}")
+    ui.info(f"Creating LUKS2 container on {device} (argon2id, passphrase-only)")
     secret = (passphrase + "\n").encode()
     ui.run(
         [
@@ -350,6 +359,29 @@ def make_swapfile() -> None:
     ui.ok("Swapfile created and activated")
 
 
+def normalize_fstab(content: str) -> str:
+    """Ensure /boot gets fsck passno=2 (with dosfstools) and btrfs mounts stay passno=0."""
+    lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            lines.append(line)
+            continue
+        fields = line.split()
+        if len(fields) == 6:
+            mountpoint, fstype = fields[1], fields[2]
+            if mountpoint == "/boot" and fstype == "vfat":
+                fields[5] = "2"
+                lines.append("\t".join(fields))
+                continue
+            if fstype == "btrfs":
+                fields[5] = "0"
+                lines.append("\t".join(fields))
+                continue
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 def write_fstab() -> None:
     ui.info("Generating /etc/fstab from the mounted system")
     if ui.DRY_RUN:
@@ -358,14 +390,28 @@ def write_fstab() -> None:
     result = ui.run(["genfstab", "-U", "/mnt"], readonly=True)
     if not result.stdout.strip():
         raise ui.ArchsetError("genfstab produced no output.")
+    normalized = normalize_fstab(result.stdout)
     ui.mkdir("/mnt/etc")
-    ui.write_text("/mnt/etc/fstab", result.stdout, mode=0o644)
-    if not ui.DRY_RUN and "subvol=/@" not in result.stdout:
+    ui.write_text("/mnt/etc/fstab", normalized, mode=0o644)
+    if "subvol=/@" not in normalized:
         raise ui.ArchsetError("Generated fstab is missing the root btrfs subvolume.")
-    ui.ok("fstab written")
+    ui.ok("fstab written (btrfs passno=0, /boot vfat passno=2)")
+
+
+def luks_uuid(device: str) -> str:
+    """Return the LUKS2 superblock UUID required by sd-encrypt (rd.luks.name=)."""
+    result = ui.run(
+        ["blkid", "-s", "UUID", "-o", "value", device],
+        readonly=True,
+    )
+    value = result.stdout.strip()
+    if not value:
+        raise ui.ArchsetError(f"Could not read LUKS UUID for {device}.")
+    return value
 
 
 def partuuid(device: str) -> str:
+    """Return GPT PARTUUID (note: sd-encrypt uses luks_uuid(), not partuuid())."""
     result = ui.run(
         ["blkid", "-s", "PARTUUID", "-o", "value", device],
         readonly=True,

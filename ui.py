@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Terminal UI, logging and subprocess helpers for archset.
-
-All installer output is written in English. Every command, its exit code and
-its output are appended to the installation log. Secrets are never logged.
-"""
+"""Terminal UI, secret-safe raw logging, single-instance lock, and subprocess helpers."""
 
 from __future__ import annotations
 
+import fcntl
 import getpass
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 LOG_DIR = "/var/log/archset"
-VERSION = "1.1.0"
+DEFAULT_LOCK_PATH = "/run/archset.lock"
+VERSION = "2.0.0"
 
 # Global switches, set by archset.py before any installer step runs.
 DRY_RUN = False
@@ -66,10 +66,49 @@ def _paint(text: str, code: str) -> str:
     return f"{code}{text}{_RESET}"
 
 
+class InstanceLock:
+    """Exclusive non-blocking lock preventing accidental double execution."""
+
+    def __init__(self, path: str | Path = DEFAULT_LOCK_PATH) -> None:
+        self.path = Path(path)
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise ArchsetError(
+                f"Another archset instance is already running (lock held: {self.path})."
+            ) from exc
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+    def __enter__(self) -> InstanceLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
+
+
 class _Logger:
     def __init__(self) -> None:
         self.path: Path | None = None
         self._fh = None
+        self._secrets: list[str] = []
 
     def init(self, log_dir: str = LOG_DIR) -> Path:
         directory = Path(log_dir)
@@ -81,14 +120,28 @@ class _Logger:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
-        self._write("INFO", f"archset {VERSION} log started")
+        self._write("INFO", f"archset {VERSION} log started (pid={os.getpid()})")
         return self.path
+
+    def register_secret(self, secret: str) -> None:
+        if secret and len(secret) >= 4 and secret not in self._secrets:
+            self._secrets.append(secret)
+
+    def clear_secrets(self) -> None:
+        self._secrets.clear()
+
+    def redact(self, text: str) -> str:
+        result = str(text)
+        for secret in self._secrets:
+            result = result.replace(secret, "***REDACTED***")
+        return result
 
     def _write(self, level: str, message: str) -> None:
         if self._fh is None:
             return
+        clean = self.redact(message)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for line in str(message).splitlines() or [""]:
+        for line in clean.splitlines() or [""]:
             self._fh.write(f"[{stamp}] {level:<8} {line}\n")
         self._fh.flush()
 
@@ -97,19 +150,19 @@ class _Logger:
 
     def info(self, message: str) -> None:
         self._write("INFO", message)
-        print(f"{_paint('[*]', _CYAN)} {message}", flush=True)
+        print(f"{_paint('[*]', _CYAN)} {self.redact(message)}", flush=True)
 
     def ok(self, message: str) -> None:
         self._write("OK", message)
-        print(f"{_paint('[+]', _GREEN)} {message}", flush=True)
+        print(f"{_paint('[+]', _GREEN)} {self.redact(message)}", flush=True)
 
     def warn(self, message: str) -> None:
         self._write("WARN", message)
-        print(f"{_paint('[!]', _YELLOW)} {message}", flush=True)
+        print(f"{_paint('[!]', _YELLOW)} {self.redact(message)}", flush=True)
 
     def error(self, message: str) -> None:
         self._write("ERROR", message)
-        print(f"{_paint('[x]', _RED)} {message}", flush=True)
+        print(f"{_paint('[x]', _RED)} {self.redact(message)}", flush=True)
 
     def step(self, number: int, total: int, title: str) -> None:
         self._write("STEP", f"step {number}/{total}: {title}")
@@ -174,6 +227,30 @@ def hr(char: str = "-", width: int = 72) -> None:
     print(_paint(char * width, _DIM))
 
 
+def render_package_table(title: str, groups: dict[str, list[str]]) -> None:
+    """Render an Arch-ISO TTY-friendly (<= 78 col) grouped package list."""
+    print()
+    hr("=")
+    print(_paint(f"  {title}", _BOLD + _CYAN))
+    hr("-")
+    total = 0
+    for idx, (label, packages) in enumerate(groups.items(), start=1):
+        total += len(packages)
+        header = f"  [{idx}] {label} ({len(packages)} pkgs)"
+        print(_paint(header, _BOLD))
+        wrapped = textwrap.fill(
+            ", ".join(packages),
+            width=72,
+            initial_indent="      ",
+            subsequent_indent="      ",
+            break_on_hyphens=False,
+        )
+        print(wrapped)
+    hr("-")
+    print(f"  Total: {total} package(s) across {len(groups)} group(s)")
+    hr("=")
+
+
 def run(
     cmd,
     *,
@@ -184,12 +261,7 @@ def run(
     timeout: int | None = None,
     cwd: str | None = None,
 ) -> Result:
-    """Run a command, log it, and return its captured output.
-
-    ``readonly=True`` marks commands that are safe during a dry run
-    (lsblk, blkid, findmnt, ...). All other commands are skipped when
-    ``DRY_RUN`` is enabled.
-    """
+    """Run a command, log raw command + output (secrets redacted), and return Result."""
     if isinstance(cmd, (list, tuple)):
         argv = [str(part) for part in cmd]
         display = shlex.join(argv)
@@ -201,7 +273,7 @@ def run(
         log.debug(f"DRY-RUN  {display}")
         return Result(display, 0, "", "")
 
-    log.debug(f"cmd      {display}")
+    log.debug(f"CMD      {display}")
     started = time.monotonic()
 
     if isinstance(input_data, str):
@@ -233,17 +305,17 @@ def run(
     stdout = proc.stdout.decode(errors="replace")
     stderr = proc.stderr.decode(errors="replace")
 
-    log.debug(f"exit     {proc.returncode} ({elapsed:.1f}s)")
+    log.debug(f"EXIT     {proc.returncode} ({elapsed:.1f}s)")
     for line in stdout.splitlines():
-        log.debug(f"out | {line[:2000]}")
+        log.debug(f"STDOUT | {line[:2000]}")
     for line in stderr.splitlines():
-        log.debug(f"err | {line[:2000]}")
+        log.debug(f"STDERR | {line[:2000]}")
 
     if check and proc.returncode != 0:
         tail = "\n".join(stderr.splitlines()[-15:])
         if not tail:
             tail = "\n".join(stdout.splitlines()[-15:])
-        raise CommandError(display, proc.returncode, tail)
+        raise CommandError(display, proc.returncode, log.redact(tail))
 
     return Result(display, proc.returncode, stdout, stderr)
 
@@ -267,7 +339,37 @@ def write_text(
         target.chmod(mode)
     if owner is not None:
         os.chown(target, owner[0], owner[1])
-    log.debug(f"write    {target} ({len(content)} bytes)")
+    log.debug(f"WRITE    {target} ({len(content)} bytes)")
+
+
+def patch_file(
+    path: str | Path,
+    transform: Callable[[str], str],
+    *,
+    mode: int | None = None,
+    default_if_missing: str | None = None,
+) -> bool:
+    """Apply an in-place line-patching transform without replacing unrelated lines."""
+    target = Path(path)
+    if DRY_RUN:
+        log.debug(f"DRY-RUN  patch {target}")
+        return True
+    if target.exists():
+        original = target.read_text(encoding="utf-8")
+    elif default_if_missing is not None:
+        original = default_if_missing
+    else:
+        warn(f"patch skipped; file not found: {target}")
+        return False
+
+    updated = transform(original)
+    if updated == original and target.exists():
+        log.debug(f"PATCH    {target} (unchanged)")
+        return True
+
+    write_text(target, updated, mode=mode)
+    log.debug(f"PATCH    {target} (updated)")
+    return True
 
 
 def mkdir(path: str | Path, mode: int = 0o755) -> None:
@@ -280,16 +382,18 @@ def mkdir(path: str | Path, mode: int = 0o755) -> None:
         target.chmod(mode)
     except PermissionError:
         pass
-    log.debug(f"mkdir    {target}")
+    log.debug(f"MKDIR    {target}")
 
 
-def copy(src: str | Path, dst: str | Path) -> None:
+def copy(src: str | Path, dst: str | Path, *, mode: int | None = None) -> None:
     if DRY_RUN:
         log.debug(f"DRY-RUN  copy {src} -> {dst}")
         return
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    log.debug(f"copy     {src} -> {dst}")
+    if mode is not None:
+        Path(dst).chmod(mode)
+    log.debug(f"COPY     {src} -> {dst}")
 
 
 def ask(
@@ -311,8 +415,8 @@ def ask(
             print(_paint("  value cannot be empty", _YELLOW))
             continue
         if validator is not None:
-            ok, message = validator(raw)
-            if not ok:
+            is_valid, message = validator(raw)
+            if not is_valid:
                 print(_paint(f"  {message or error_message}", _YELLOW))
                 continue
         return raw
@@ -345,7 +449,8 @@ def ask_password(
             if first != second:
                 print(_paint("  passwords do not match", _YELLOW))
                 continue
-        log.debug("password captured (value intentionally not logged)")
+        log.register_secret(first)
+        log.debug(f"password captured for '{prompt}' (value redacted)")
         return first
 
 
