@@ -88,15 +88,56 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
 
         sysctl_conf = configs.load_file("etc/sysctl.d/99-knsfd.conf")
         self.assertIn("vm.swappiness                                                           = 100", sysctl_conf)
+        self.assertIn("kernel.unprivileged_bpf_disabled                                        = 1", sysctl_conf)
         self.assertIn("kernel.yama.ptrace_scope                                                = 1", sysctl_conf)
         self.assertIn("vm.mmap_rnd_bits                                                        = 32", sysctl_conf)
         self.assertIn("vm.mmap_rnd_compat_bits                                                 = 16", sysctl_conf)
+        self.assertIn("net.ipv4.conf.all.log_martians                                          = 1", sysctl_conf)
+        self.assertIn("net.ipv6.conf.all.accept_redirects                                      = 0", sysctl_conf)
+
+        wpa_sandbox = configs.load_file(
+            "etc/systemd/system/wpa_supplicant.service.d/10-hardening.conf"
+        )
+        self.assertIn("ProtectSystem=strict", wpa_sandbox)
+        self.assertIn("RuntimeDirectory=wpa_supplicant", wpa_sandbox)
+        self.assertIn("DevicePolicy=closed", wpa_sandbox)
+        self.assertIn("DeviceAllow=/dev/rfkill rw", wpa_sandbox)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", wpa_sandbox)
+        self.assertNotIn("PrivateDevices=true", wpa_sandbox)
+
+        audit_rules = configs.load_file("etc/audit/rules.d/30-archset.rules")
+        active_audit = [
+            l.strip()
+            for l in audit_rules.splitlines()
+            if l.strip() and not l.lstrip().startswith("#")
+        ]
+        self.assertIn("-w /etc/shadow -p wa -k identity", active_audit)
+        self.assertIn("-w /etc/sudoers.d/ -p wa -k sudoers", active_audit)
+        self.assertIn("-w /etc/nftables.conf -p wa -k firewall", active_audit)
+        self.assertNotIn("-e 2", active_audit)
+        self.assertEqual(static_map["/etc/audit/rules.d/30-archset.rules"], 0o640)
+
+        coredump_conf = configs.load_file("etc/systemd/coredump.conf.d/00-limit.conf")
+        self.assertIn("Storage=none", coredump_conf)
+        self.assertIn("ProcessSizeMax=0", coredump_conf)
+        limits_conf = configs.load_file("etc/security/limits.d/10-coredump.conf")
+        self.assertIn("* hard core 0", limits_conf)
+
+        mod_bl_active = [
+            l.strip()
+            for l in configs.load_file("etc/modprobe.d/blacklist-unused.conf").splitlines()
+            if l.strip() and not l.lstrip().startswith("#")
+        ]
+        for mod in ("sctp", "rds", "tipc", "firewire-ohci"):
+            self.assertIn(f"install {mod} /usr/bin/false", mod_bl_active)
+        self.assertFalse(any("usb-storage" in l for l in mod_bl_active))
 
         self.assertIn("Defaults umask = 0022", configs.SUDOERS_UMASK)
         self.assertIn("Defaults umask_override", configs.SUDOERS_UMASK)
 
         self.assertIn("audit", system.INSTALL_PHASES["Network, Wi-Fi, Bluetooth & Security"])
         self.assertIn("auditd.service", system.REQUIRED_SERVICES)
+        self.assertIn("audit-rules.service", system.REQUIRED_SERVICES)
 
     def test_verify_enforces_safe_shadow_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +155,10 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
                 "etc/nftables.conf",
                 "etc/sysctl.d/99-knsfd.conf",
                 "etc/sudoers.d/20-umask",
+                "etc/audit/rules.d/30-archset.rules",
+                "etc/security/limits.d/10-coredump.conf",
+                "etc/modprobe.d/blacklist-unused.conf",
+                "etc/systemd/system/wpa_supplicant.service.d/10-hardening.conf",
                 "etc/systemd/resolved.conf.d/10-dnscrypt.conf",
                 "etc/NetworkManager/dispatcher.d/10-enforce-no-ipv6.sh",
                 "home/alice/.zshenv",

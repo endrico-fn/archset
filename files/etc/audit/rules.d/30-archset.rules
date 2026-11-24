@@ -1,0 +1,29 @@
+## Managed by archset — low-overhead, high-signal Linux Audit ruleset.
+## Deliberately avoids broad file-open syscall rules and immutable (-e 2) locks
+## so desktop/compiler I/O stays zero-overhead and rules remain maintainable.
+
+-D
+-b 8192
+--backlog_wait_time 60000
+-f 1
+
+## Identity, authentication, PAM & privilege escalation configs
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/login.defs -p wa -k auth-config
+-w /etc/pam.d/ -p wa -k auth-config
+-w /etc/security/ -p wa -k auth-config
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+## Firewall, DNS & UKI boot chain configs
+-w /etc/nftables.conf -p wa -k firewall
+-w /etc/dnscrypt-proxy/dnscrypt-proxy.toml -p wa -k dns-config
+-w /etc/cmdline.d/ -p wa -k boot-config
+-w /etc/mkinitcpio.conf.d/ -p wa -k boot-config
+-w /boot/EFI/Linux/ -p wa -k boot-uki
+
+## Kernel module load/unload syscalls (64-bit)
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F key=kernel-modules

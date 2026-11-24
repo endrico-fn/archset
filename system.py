@@ -149,6 +149,7 @@ REQUIRED_SERVICES = [
     "plasmalogin.service",
     "apparmor.service",
     "auditd.service",
+    "audit-rules.service",
     "nftables.service",
     "systemd-resolved.service",
     "dnscrypt-proxy.service",
@@ -601,6 +602,12 @@ def verify(username: str) -> None:
         target_path("/etc/nftables.conf"): "nftables configuration",
         target_path("/etc/sysctl.d/99-knsfd.conf"): "sysctl hardening config",
         target_path("/etc/sudoers.d/20-umask"): "sudoers 0022 umask override",
+        target_path("/etc/audit/rules.d/30-archset.rules"): "auditd security ruleset",
+        target_path("/etc/security/limits.d/10-coredump.conf"): "PAM limits core dump disable",
+        target_path("/etc/modprobe.d/blacklist-unused.conf"): "unused protocol & FireWire blacklist",
+        target_path(
+            "/etc/systemd/system/wpa_supplicant.service.d/10-hardening.conf"
+        ): "wpa_supplicant systemd sandbox drop-in",
         target_path("/etc/systemd/resolved.conf.d/10-dnscrypt.conf"): "resolved dnscrypt drop-in",
         target_path("/etc/NetworkManager/dispatcher.d/10-enforce-no-ipv6.sh"): "NM IPv6 disable hook",
         f"{home}/.zshenv": "zsh .zshenv symlink",
