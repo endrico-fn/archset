@@ -35,11 +35,13 @@ from pathlib import Path
 
 import additional
 import disk
+import hardware
 import system
 import ui
 
 TOTAL_STEPS = 12
 DEFAULT_TIMEZONE = "Asia/Jakarta"
+DEFAULT_REGDOM = "ID"
 _storage_started = False
 
 REQUIRED_TOOLS = [
@@ -68,6 +70,8 @@ class Inputs:
     user_password: str
     luks_passphrase: str
     additional_packages: list[str] = field(default_factory=list)
+    timezone: str = DEFAULT_TIMEZONE
+    regdom: str = DEFAULT_REGDOM
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -102,8 +106,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--username", help="primary user (prompted when omitted)")
     parser.add_argument(
         "--timezone",
-        default=DEFAULT_TIMEZONE,
-        help=f"system timezone (default: {DEFAULT_TIMEZONE})",
+        default=None,
+        help=f"system timezone (prompted when omitted; default: {DEFAULT_TIMEZONE})",
+    )
+    parser.add_argument(
+        "--regdom",
+        default=None,
+        help=f"2-letter ISO Wi-Fi regulatory domain (prompted when omitted; default: {DEFAULT_REGDOM})",
     )
     parser.add_argument(
         "--log-dir",
@@ -147,6 +156,21 @@ def _username_validator(value: str) -> tuple[bool, str]:
         return False, "use lowercase letters, digits, underscore or hyphen (max 32)"
     if value in ("root", "nobody"):
         return False, "that username is reserved"
+    return True, ""
+
+
+def _timezone_validator(value: str) -> tuple[bool, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_+./-]+", value) or ".." in value:
+        return False, "invalid timezone format (example: Asia/Jakarta or UTC)"
+    zoneinfo = Path("/usr/share/zoneinfo")
+    if zoneinfo.is_dir() and not (zoneinfo / value).is_file():
+        return False, f"timezone '{value}' not found under /usr/share/zoneinfo"
+    return True, ""
+
+
+def _regdom_validator(value: str) -> tuple[bool, str]:
+    if not re.fullmatch(r"[A-Za-z]{2}|00", value.strip()):
+        return False, "enter a 2-letter ISO country code (e.g. ID, US, SG, JP) or 00"
     return True, ""
 
 
@@ -198,12 +222,18 @@ def preflight(args: argparse.Namespace) -> None:
     ui.run(["timedatectl", "set-ntp", "true"], check=False)
 
     check_network()
-    system.select_mirrors()
+    system.select_mirrors(args.regdom or DEFAULT_REGDOM)
     system.refresh_iso_keyring()
     ui.ok("Preflight checks passed")
 
 
-def collect_inputs(args: argparse.Namespace) -> Inputs:
+def collect_inputs(
+    args: argparse.Namespace,
+    hw: hardware.HardwareProfile | None = None,
+) -> Inputs:
+    profile = hw or hardware.detect()
+    ui.info(f"Detected hardware profile: {profile.summary()}")
+
     if args.hostname:
         ok, message = _hostname_validator(args.hostname)
         if not ok:
@@ -224,13 +254,39 @@ def collect_inputs(args: argparse.Namespace) -> Inputs:
     else:
         username = ui.ask("Username", validator=_username_validator)
 
+    if args.timezone:
+        ok, message = _timezone_validator(args.timezone)
+        if not ok:
+            raise ui.ArchsetError(f"Invalid timezone: {message}")
+        timezone = args.timezone
+    else:
+        timezone = ui.ask(
+            "Timezone",
+            default=DEFAULT_TIMEZONE,
+            validator=_timezone_validator,
+        )
+
+    if args.regdom:
+        ok, message = _regdom_validator(args.regdom)
+        if not ok:
+            raise ui.ArchsetError(f"Invalid regdom: {message}")
+        regdom = args.regdom.upper()
+    else:
+        regdom = ui.ask(
+            "Wi-Fi regulatory domain (ISO 2-letter)",
+            default=DEFAULT_REGDOM,
+            validator=_regdom_validator,
+        ).upper()
+
     print()
     ui.info("Set separate passwords for root, primary user, and LUKS2 encryption.")
     root_password = ui.ask_password("root password")
     user_password = ui.ask_password(f"user '{username}' password")
     luks_passphrase = ui.ask_password("LUKS2 passphrase (no TPM2)")
 
-    additional_packages = additional.prompt_additional_selection(interactive=True)
+    additional_packages = additional.prompt_additional_selection(
+        interactive=True, hw=profile
+    )
 
     return Inputs(
         hostname=hostname,
@@ -239,6 +295,8 @@ def collect_inputs(args: argparse.Namespace) -> Inputs:
         user_password=user_password,
         luks_passphrase=luks_passphrase,
         additional_packages=additional_packages,
+        timezone=timezone,
+        regdom=regdom,
     )
 
 
@@ -285,7 +343,8 @@ def confirm_destruction(info: disk.DiskInfo, inputs: Inputs) -> None:
     print(f"  Size       : {ui.format_bytes(info.size)}")
     print(f"  Hostname   : {inputs.hostname}")
     print(f"  Username   : {inputs.username}")
-    print("  Boot Stack : UEFI + systemd-boot + UKI (systemd + sd-encrypt, no TPM2)")
+    print(f"  Region     : {inputs.timezone} (Wi-Fi regdom: {inputs.regdom})")
+    print("  Boot Stack : UEFI + systemd-boot + UKI (sd-encrypt + ARCHRELIUS TUI, no TPM2)")
     print("  Network    : IPv6 disabled + dnscrypt-proxy + nftables")
     print(f"  Additional : {len(inputs.additional_packages)} optional package(s)")
     print()
@@ -302,13 +361,22 @@ def confirm_destruction(info: disk.DiskInfo, inputs: Inputs) -> None:
         raise ui.ArchsetError("Installation cancelled by the user.")
 
 
-def install(inputs: Inputs, info: disk.DiskInfo, args: argparse.Namespace) -> None:
+def install(
+    inputs: Inputs,
+    info: disk.DiskInfo,
+    args: argparse.Namespace,
+    *,
+    hw: hardware.HardwareProfile | None = None,
+) -> None:
     global _storage_started
+    profile = hw or hardware.detect()
     target = info.path
     esp = disk.part_path(target, 1)
     root_part = disk.part_path(target, 2)
     mapper = f"/dev/mapper/{disk.LUKS_NAME}"
     enable_multilib = additional.needs_multilib(inputs.additional_packages)
+    tz = args.timezone or inputs.timezone or DEFAULT_TIMEZONE
+    regdom = (args.regdom or inputs.regdom or DEFAULT_REGDOM).upper()
 
     ui.step(5, TOTAL_STEPS, f"Wiping and partitioning {target}")
     _storage_started = True
@@ -328,19 +396,19 @@ def install(inputs: Inputs, info: disk.DiskInfo, args: argparse.Namespace) -> No
     disk.make_swapfile()
 
     ui.step(8, TOTAL_STEPS, "Installing base stack and patching pacman.conf")
-    system.install_base()
+    system.install_base(profile)
     disk.write_fstab()
     system.copy_mirrorlist()
     system.configure_pacman(enable_multilib=enable_multilib)
 
     ui.step(9, TOTAL_STEPS, "Installing phased system, desktop, dev and optional packages")
-    system.install_phases(inputs.additional_packages)
+    system.install_phases(inputs.additional_packages, hw=profile, regdom=regdom)
 
     ui.step(10, TOTAL_STEPS, "Configuring locale, users, snapper, configs and services")
-    system.configure_locale(inputs.hostname, args.timezone)
+    system.configure_locale(inputs.hostname, tz)
     system.create_user(inputs.username, inputs.user_password, inputs.root_password)
     system.setup_snapper()
-    system.inject_system_configs()
+    system.inject_system_configs(profile, regdom=regdom)
     system.enable_services()
 
     ui.step(11, TOTAL_STEPS, "Configuring systemd-boot and building sd-encrypt UKI")
@@ -349,7 +417,7 @@ def install(inputs: Inputs, info: disk.DiskInfo, args: argparse.Namespace) -> No
         if ui.DRY_RUN
         else disk.luks_uuid(root_part)
     )
-    system.setup_bootloader(root_luks_uuid)
+    system.setup_bootloader(root_luks_uuid, profile)
 
     ui.step(12, TOTAL_STEPS, "Applying user dotfiles, finalizing DNS and exporting logs")
     system.inject_user_configs(inputs.username, inputs.hostname)
@@ -437,11 +505,13 @@ def main(argv: list[str] | None = None) -> int:
                     assume_yes=args.yes,
                 )
 
+            hw = hardware.detect()
+
             ui.step(1, TOTAL_STEPS, "Running preflight checks")
             preflight(args)
 
             ui.step(2, TOTAL_STEPS, "Collecting installation settings")
-            inputs = collect_inputs(args)
+            inputs = collect_inputs(args, hw)
 
             ui.step(3, TOTAL_STEPS, "Selecting the target disk")
             info = select_disk(args)
@@ -449,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             ui.step(4, TOTAL_STEPS, "Confirming the destructive operation")
             confirm_destruction(info, inputs)
 
-            install(inputs, info, args)
+            install(inputs, info, args, hw=hw)
         except KeyboardInterrupt:
             ui.error("Installation interrupted by the user.")
             cleanup()

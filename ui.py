@@ -251,6 +251,64 @@ def render_package_table(title: str, groups: dict[str, list[str]]) -> None:
     hr("=")
 
 
+def render_download_plan(rows: list[dict[str, object]]) -> tuple[int, float, float]:
+    """Render an Arch-TTY-safe (<= 78 col) package download & installed size table.
+
+    Returns ``(new_count, total_download_mib, total_installed_mib)``.
+    """
+    print()
+    hr("=", 76)
+    print(_paint("  Download & Installation Plan", _BOLD + _CYAN))
+    hr("-", 76)
+    header = f"  {'Package':<22} {'Repo':<9} {'Version':<17} {'Download':>10}  {'Status':<10}"
+    print(_paint(header, _BOLD))
+    hr("-", 76)
+
+    new_count = 0
+    total_dl = 0.0
+    total_inst = 0.0
+
+    for row in rows:
+        name = str(row.get("name", ""))[:22]
+        repo = str(row.get("repo", "-"))[:9]
+        version = str(row.get("version", "-"))[:17]
+        dl_mib = row.get("download_mib")
+        inst_mib = row.get("installed_mib")
+        installed = bool(row.get("installed", False))
+
+        if isinstance(dl_mib, (int, float)):
+            dl_str = f"{dl_mib:6.1f} MiB"
+            if not installed:
+                total_dl += float(dl_mib)
+        else:
+            dl_str = "       n/a"
+
+        if isinstance(inst_mib, (int, float)) and not installed:
+            total_inst += float(inst_mib)
+
+        if installed:
+            status_raw = "installed"
+            status_str = _paint(f"{status_raw:<10}", _DIM)
+        else:
+            new_count += 1
+            status_raw = "download"
+            status_str = _paint(f"{status_raw:<10}", _GREEN)
+
+        print(f"  {name:<22} {repo:<9} {version:<17} {dl_str:>10}  {status_str}")
+
+    hr("-", 76)
+    installed_count = len(rows) - new_count
+    print(
+        f"  Packages : {len(rows)} selected ({new_count} to download, "
+        f"{installed_count} already installed)"
+    )
+    print(
+        f"  Est. Size: ~{total_dl:.1f} MiB download  |  ~{total_inst:.1f} MiB net disk usage"
+    )
+    hr("=", 76)
+    return new_count, total_dl, total_inst
+
+
 def run(
     cmd,
     *,

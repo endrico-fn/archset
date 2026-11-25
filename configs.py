@@ -43,15 +43,25 @@ SYSTEM_STATIC_FILES: list[tuple[str, str, int]] = [
     ("etc/systemd/zram-generator.conf", "/etc/systemd/zram-generator.conf", 0o644),
     ("etc/security/limits.d/10-coredump.conf", "/etc/security/limits.d/10-coredump.conf", 0o644),
     ("etc/audit/rules.d/30-archset.rules", "/etc/audit/rules.d/30-archset.rules", 0o640),
-    ("etc/modprobe.d/i915.conf", "/etc/modprobe.d/i915.conf", 0o644),
-    ("etc/modprobe.d/audio_powersave.conf", "/etc/modprobe.d/audio_powersave.conf", 0o644),
-    ("etc/modprobe.d/rtw88_powersave.conf", "/etc/modprobe.d/rtw88_powersave.conf", 0o644),
     ("etc/modprobe.d/usb_powersave.conf", "/etc/modprobe.d/usb_powersave.conf", 0o644),
     ("etc/modprobe.d/blacklist-unused.conf", "/etc/modprobe.d/blacklist-unused.conf", 0o644),
     ("etc/initcpio/install/sd-archrelius", "/etc/initcpio/install/sd-archrelius", 0o644),
     ("usr/local/src/archrelius-askpw.c", "/usr/local/src/archrelius-askpw.c", 0o644),
     ("usr/local/bin/importwgp", "/usr/local/bin/importwgp", 0o755),
 ]
+
+# Hardware-specific modprobe configs injected conditionally via hardware.HardwareProfile
+MODPROBE_I915 = ("etc/modprobe.d/i915.conf", "/etc/modprobe.d/i915.conf", 0o644)
+MODPROBE_RTW88 = (
+    "etc/modprobe.d/rtw88_powersave.conf",
+    "/etc/modprobe.d/rtw88_powersave.conf",
+    0o644,
+)
+MODPROBE_AUDIO_HDA = (
+    "etc/modprobe.d/audio_powersave.conf",
+    "/etc/modprobe.d/audio_powersave.conf",
+    0o644,
+)
 
 ASKPW_SRC_DST = "/usr/local/src/archrelius-askpw.c"
 ASKPW_BIN_DST = "/usr/local/lib/systemd/archrelius-askpw"

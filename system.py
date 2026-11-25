@@ -9,21 +9,23 @@ from pathlib import Path
 
 import configs
 import disk
+import hardware
 import patcher
 import ui
 
 TARGET = "/mnt"
 TIMEZONE = "Asia/Jakarta"
+DEFAULT_REGDOM = "ID"
 DEFAULT_SHELL = "/usr/bin/zsh"
 
 # Phase 1: Base OS, kernel, LUKS2, Btrfs, UKI, and recovery/audit essentials
+# (CPU microcode is appended dynamically by base_packages(hw))
 BASE_PACKAGES = [
     "base",
     "base-devel",
     "sudo",
     "linux",
     "linux-firmware",
-    "intel-ucode",
     "mkinitcpio",
     "btrfs-progs",
     "dosfstools",
@@ -37,6 +39,7 @@ BASE_PACKAGES = [
 ]
 
 # Subsequent structured package phases installed inside arch-chroot
+# (GPU drivers & region OCR packages are adapted dynamically by build_install_phases)
 INSTALL_PHASES: dict[str, list[str]] = {
     "Network, Wi-Fi, Bluetooth & Security": [
         "networkmanager",
@@ -143,6 +146,46 @@ INSTALL_PHASES: dict[str, list[str]] = {
     ],
 }
 
+
+def base_packages(hw: hardware.HardwareProfile | None = None) -> list[str]:
+    profile = hw or hardware.detect()
+    return [*BASE_PACKAGES, *profile.ucode_packages()]
+
+
+def build_install_phases(
+    hw: hardware.HardwareProfile | None = None,
+    *,
+    regdom: str = DEFAULT_REGDOM,
+) -> dict[str, list[str]]:
+    profile = hw or hardware.detect()
+    audio_and_power = [
+        "pipewire",
+        "pipewire-alsa",
+        "pipewire-jack",
+        "pipewire-pulse",
+        "gst-plugin-pipewire",
+        "libpulse",
+        "wireplumber",
+        "alsa-utils",
+        "power-profiles-daemon",
+        "fwupd",
+    ]
+    dev_pkgs = [
+        pkg
+        for pkg in INSTALL_PHASES["Terminal, Shell, Core Utilities & Development"]
+        if pkg != "tesseract-data-ind" or regdom.upper() == "ID"
+    ]
+    return {
+        "Network, Wi-Fi, Bluetooth & Security": list(
+            INSTALL_PHASES["Network, Wi-Fi, Bluetooth & Security"]
+        ),
+        "Graphics Drivers & Audio": [*profile.graphics_packages(), *audio_and_power],
+        "Desktop Environment (KDE Plasma) & Fonts": list(
+            INSTALL_PHASES["Desktop Environment (KDE Plasma) & Fonts"]
+        ),
+        "Terminal, Shell, Core Utilities & Development": dev_pkgs,
+    }
+
 REQUIRED_SERVICES = [
     "NetworkManager.service",
     "NetworkManager-dispatcher.service",
@@ -203,8 +246,10 @@ def _server_count(path: str = "/etc/pacman.d/mirrorlist") -> int:
     return sum(1 for line in text.splitlines() if line.strip().startswith("Server"))
 
 
-def select_mirrors() -> None:
-    ui.info("Selecting HTTPS mirrors with reflector (Indonesia, Singapore, Japan)")
+def select_mirrors(regdom: str = DEFAULT_REGDOM) -> None:
+    is_apac = regdom.upper() in ("ID", "SG", "MY", "JP")
+    region_note = "Indonesia, Singapore, Japan" if is_apac else "global HTTPS fastest"
+    ui.info(f"Selecting HTTPS mirrors with reflector ({region_note})")
     ui.run(["systemctl", "stop", "reflector.service"], check=False)
     if shutil.which("reflector") is None:
         ui.warn("reflector is not present in the live environment; installing it")
@@ -214,27 +259,33 @@ def select_mirrors() -> None:
             ui.warn(
                 f"Could not install reflector; using the existing mirrorlist: {exc}"
             )
-    try:
-        ui.run(
+    reflector_cmd = ["reflector"]
+    if is_apac:
+        reflector_cmd.extend(
             [
-                "reflector",
                 "--country",
                 "Indonesia",
                 "--country",
                 "Singapore",
                 "--country",
                 "Japan",
-                "--protocol",
-                "https",
-                "--latest",
-                "20",
-                "--sort",
-                "rate",
-                "--save",
-                "/etc/pacman.d/mirrorlist",
-                "--verbose",
             ]
         )
+    reflector_cmd.extend(
+        [
+            "--protocol",
+            "https",
+            "--latest",
+            "20",
+            "--sort",
+            "rate",
+            "--save",
+            "/etc/pacman.d/mirrorlist",
+            "--verbose",
+        ]
+    )
+    try:
+        ui.run(reflector_cmd)
     except ui.CommandError as exc:
         ui.warn(f"reflector failed: {exc}")
     count = _server_count()
@@ -267,13 +318,19 @@ def refresh_iso_keyring() -> None:
         ui.warn(f"Could not refresh archlinux-keyring (continuing): {exc}")
 
 
-def install_base() -> None:
-    pacstrap(BASE_PACKAGES, "base & filesystem stack", init_keyring=True)
+def install_base(hw: hardware.HardwareProfile | None = None) -> None:
+    pacstrap(base_packages(hw), "base & filesystem stack", init_keyring=True)
 
 
-def install_phases(additional_packages: list[str] | None = None) -> None:
+def install_phases(
+    additional_packages: list[str] | None = None,
+    *,
+    hw: hardware.HardwareProfile | None = None,
+    regdom: str = DEFAULT_REGDOM,
+) -> None:
     chroot(["pacman", "-Sy", "--noconfirm"])
-    for label, packages in INSTALL_PHASES.items():
+    phases = build_install_phases(hw, regdom=regdom)
+    for label, packages in phases.items():
         ui.info(f"Installing phase: {label} ({len(packages)} packages)")
         chroot(["pacman", "-S", "--noconfirm", "--needed", *packages])
     if additional_packages:
@@ -395,10 +452,32 @@ def enable_services() -> None:
     ui.ok("Services enabled and TPM2 units masked")
 
 
-def inject_system_configs() -> None:
-    ui.info("Injecting drop-ins, nftables ruleset, and targeted system config patches")
+def inject_system_configs(
+    hw: hardware.HardwareProfile | None = None,
+    *,
+    regdom: str = DEFAULT_REGDOM,
+) -> None:
+    profile = hw or hardware.detect()
+    reg_code = regdom.upper()
+    ui.info(
+        f"Injecting drop-ins, nftables ruleset, and hardware-matched configs ({profile.summary()})"
+    )
     for src_rel, dst_abs, mode in configs.SYSTEM_STATIC_FILES:
         write(dst_abs, configs.load_file(src_rel), mode=mode)
+
+    if "intel" in profile.gpus:
+        src_rel, dst_abs, mode = configs.MODPROBE_I915
+        write(dst_abs, configs.load_file(src_rel), mode=mode)
+    if profile.has_rtw88_wifi:
+        src_rel, dst_abs, mode = configs.MODPROBE_RTW88
+        write(dst_abs, configs.load_file(src_rel), mode=mode)
+    if profile.has_intel_hda:
+        src_rel, dst_abs, mode = configs.MODPROBE_AUDIO_HDA
+        write(dst_abs, configs.load_file(src_rel), mode=mode)
+    if "nvidia" in profile.gpus:
+        ui.warn(
+            "NVIDIA GPU detected: kernel lockdown=integrity blocks unsigned out-of-tree DKMS modules."
+        )
 
     # Targeted line-patching on upstream-owned config files (preserving defaults/comments)
     ui.patch_file(
@@ -412,8 +491,8 @@ def inject_system_configs() -> None:
     )
     ui.patch_file(
         target_path("/etc/conf.d/wireless-regdom"),
-        lambda text: patcher.patch_conf_kv(text, "WIRELESS_REGDOM", '"ID"'),
-        default_if_missing='WIRELESS_REGDOM="ID"\n',
+        lambda text: patcher.patch_conf_kv(text, "WIRELESS_REGDOM", f'"{reg_code}"'),
+        default_if_missing=f'WIRELESS_REGDOM="{reg_code}"\n',
     )
     ui.patch_file(
         target_path("/etc/apparmor/parser.conf"),
@@ -431,12 +510,16 @@ def inject_system_configs() -> None:
     ui.ok("System drop-ins, nftables, and line-patched configs applied")
 
 
-def setup_bootloader(luks_uuid: str) -> None:
-    ui.info("Configuring systemd-boot + UKI (mkinitcpio drop-in: systemd + sd-encrypt)")
-    # Drop-in override: never overwrite upstream /etc/mkinitcpio.conf
+def setup_bootloader(
+    luks_uuid: str,
+    hw: hardware.HardwareProfile | None = None,
+) -> None:
+    profile = hw or hardware.detect()
+    ui.info("Configuring systemd-boot + UKI (mkinitcpio drop-in: systemd + sd-encrypt + sd-archrelius)")
+    # Drop-in override matched to detected GPU KMS modules
     write(
         configs.MKINITCPIO_DROPIN_DST,
-        configs.load_file(configs.MKINITCPIO_DROPIN_SRC),
+        profile.mkinitcpio_dropin(),
         mode=0o644,
     )
     # Modular kernel command-line drop-ins read by mkinitcpio UKI builder

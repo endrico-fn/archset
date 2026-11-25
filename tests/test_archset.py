@@ -27,6 +27,7 @@ import additional  # noqa: E402
 import archset  # noqa: E402
 import configs  # noqa: E402
 import disk  # noqa: E402
+import hardware  # noqa: E402
 import system  # noqa: E402
 import ui  # noqa: E402
 
@@ -452,6 +453,7 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                 [
                     str(bin_path),
                     "--query",
+                    "--no-intro",
                     f"--tty={os.ttyname(slave_fd)}",
                     f"--ask-dir={ask_dir}",
                 ],
@@ -459,42 +461,65 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
             )
             try:
                 self.assertEqual(notify_sock.recv(64), b"READY=1\n")
-                # Read initial 160x50 TUI frame (box_col = (160-50)//2 + 1 = 56)
+                # Read initial 160x50 TUI frame with greenish-cyan (#64beaf = 100;190;175) accent
                 rendered = bytearray()
-                deadline = time.time() + 1.0
+                deadline = time.time() + 1.2
                 while time.time() < deadline:
                     r, _, _ = select.select([master_fd], [], [], 0.05)
                     if r:
-                        rendered.extend(os.read(master_fd, 8192))
-                        if "┌─ Enter passphrase for /dev/nvme0n1p2: " in rendered.decode(
+                        rendered.extend(os.read(master_fd, 16384))
+                        if "Enter passphrase for /dev/nvme0n1p2: " in rendered.decode(
                             "utf-8", "replace"
                         ):
                             break
                 text_ui = rendered.decode("utf-8", "replace")
-                self.assertIn("┌─ Enter passphrase for /dev/nvme0n1p2: ─────────┐", text_ui)
-                self.assertIn("\x1b[27;56H┌─", text_ui)
+                self.assertIn("Enter passphrase for /dev/nvme0n1p2: ", text_ui)
+                self.assertIn("38;2;100;190;175m", text_ui)
 
-                # Simulate i915drmfb deferred takeover switching console to 170x48 without keypress
+                # Simulate i915drmfb deferred takeover switching console to 170x48
                 fcntl.ioctl(
                     slave_fd,
                     termios.TIOCSWINSZ,
                     struct.pack("HHHH", 48, 170, 1366, 768),
                 )
-                resized_out = bytearray()
-                deadline = time.time() + 1.0
-                expected_resized = "\x1b[26;61H┌─ Enter passphrase for /dev/nvme0n1p2: ─────────┐"
+
+                # Type partial passphrase, press Tab to switch theme live (must NOT erase buffer!),
+                # wait 1 frame to observe Theme 2/4 toast, then Backspace + Arrow-Left + finish!
+                os.write(master_fd, b"Secr\t")
+                toast_seen = False
+                deadline = time.time() + 1.2
+                buf2 = bytearray()
                 while time.time() < deadline:
                     r, _, _ = select.select([master_fd], [], [], 0.05)
                     if r:
-                        resized_out.extend(os.read(master_fd, 8192))
-                        if expected_resized in resized_out.decode("utf-8", "replace"):
+                        buf2.extend(os.read(master_fd, 32768))
+                        if "Theme 2/4: Aurora Stardust" in buf2.decode("utf-8", "replace"):
+                            toast_seen = True
                             break
-                self.assertIn(expected_resized, resized_out.decode("utf-8", "replace"))
+                self.assertTrue(toast_seen, "Tab live theme switch toast did not render")
 
-                # Send passphrase with Backspace + Arrow-Left escape sequence
-                os.write(master_fd, b"SecrX\x7f\x1b[Det#99\n")
-                reply = recv_sock.recv(256)
+                os.write(master_fd, b"X\x7f\x1b[Det#99\n")
+                # Drain PTY output while waiting for socket datagram & process exit
+                deadline = time.time() + 2.0
+                reply = b""
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_fd, recv_sock], [], [], 0.05)
+                    if master_fd in r:
+                        try:
+                            os.read(master_fd, 32768)
+                        except OSError:
+                            pass
+                    if recv_sock in r:
+                        reply = recv_sock.recv(256)
+                        break
                 self.assertEqual(reply, b"+Secret#99")
+                while proc.poll() is None and time.time() < deadline:
+                    r, _, _ = select.select([master_fd], [], [], 0.02)
+                    if r:
+                        try:
+                            os.read(master_fd, 32768)
+                        except OSError:
+                            break
                 self.assertEqual(proc.wait(timeout=3), 0)
             finally:
                 if proc.poll() is None:
@@ -504,6 +529,131 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                 os.close(slave_fd)
                 recv_sock.close()
                 notify_sock.close()
+
+
+class HardwareAndAdditionalPlanTests(unittest.TestCase):
+    def test_hardware_detect_adapts_intel_amd_and_vm_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            # 1) AMD laptop without Realtek Wi-Fi
+            cpu_amd = base / "cpu_amd"
+            cpu_amd.write_text("vendor_id\t: AuthenticAMD\nflags\t\t: fpu sse2\n", encoding="utf-8")
+            pci_amd = base / "pci_amd"
+            (pci_amd / "0000:03:00.0").mkdir(parents=True)
+            (pci_amd / "0000:03:00.0/class").write_text("0x030000\n", encoding="utf-8")
+            (pci_amd / "0000:03:00.0/vendor").write_text("0x1002\n", encoding="utf-8")
+            (pci_amd / "0000:02:00.0").mkdir(parents=True)
+            (pci_amd / "0000:02:00.0/class").write_text("0x028000\n", encoding="utf-8")
+            (pci_amd / "0000:02:00.0/vendor").write_text("0x8086\n", encoding="utf-8")
+
+            hw_amd = hardware.detect(
+                proc_cpuinfo=cpu_amd,
+                pci_dir=pci_amd,
+                dmi_dir=base / "no_dmi",
+                modules_dir=base / "no_mods",
+            )
+            self.assertEqual(hw_amd.cpu_vendor, "amd")
+            self.assertFalse(hw_amd.is_vm)
+            self.assertFalse(hw_amd.has_rtw88_wifi)
+            self.assertEqual(hw_amd.ucode_packages(), ["amd-ucode"])
+            self.assertEqual(hw_amd.initramfs_modules(), ["amdgpu"])
+            self.assertIn("MODULES=(amdgpu)", hw_amd.mkinitcpio_dropin())
+            self.assertIn("vulkan-radeon", hw_amd.graphics_packages())
+            self.assertNotIn("vulkan-intel", hw_amd.graphics_packages())
+            self.assertEqual(hw_amd.multilib_gpu_packages(), ["lib32-vulkan-radeon"])
+
+            # Verify inject_system_configs skips i915.conf and rtw88_powersave.conf on AMD+iwlwifi
+            written_dsts: list[str] = []
+            prev_dry = ui.DRY_RUN
+            ui.DRY_RUN = True
+            try:
+                with (
+                    mock.patch.object(
+                        system, "write", side_effect=lambda dst, *_a, **_k: written_dsts.append(dst)
+                    ),
+                    mock.patch.object(ui, "patch_file"),
+                ):
+                    system.inject_system_configs(hw_amd, regdom="US")
+            finally:
+                ui.DRY_RUN = prev_dry
+            self.assertNotIn("/etc/modprobe.d/i915.conf", written_dsts)
+            self.assertNotIn("/etc/modprobe.d/rtw88_powersave.conf", written_dsts)
+            phases_us = system.build_install_phases(hw_amd, regdom="US")
+            self.assertNotIn(
+                "tesseract-data-ind",
+                phases_us["Terminal, Shell, Core Utilities & Development"],
+            )
+
+            # 2) QEMU/KVM Virtual Machine
+            cpu_vm = base / "cpu_vm"
+            cpu_vm.write_text("vendor_id\t: GenuineIntel\nflags\t\t: fpu hypervisor\n", encoding="utf-8")
+            dmi_vm = base / "dmi_vm"
+            dmi_vm.mkdir()
+            (dmi_vm / "sys_vendor").write_text("QEMU\n", encoding="utf-8")
+            pci_vm = base / "pci_vm"
+            (pci_vm / "0000:00:01.0").mkdir(parents=True)
+            (pci_vm / "0000:00:01.0/class").write_text("0x030000\n", encoding="utf-8")
+            (pci_vm / "0000:00:01.0/vendor").write_text("0x1af4\n", encoding="utf-8")
+
+            hw_vm = hardware.detect(
+                proc_cpuinfo=cpu_vm,
+                pci_dir=pci_vm,
+                dmi_dir=dmi_vm,
+                modules_dir=base / "no_mods",
+            )
+            self.assertTrue(hw_vm.is_vm)
+            self.assertEqual(hw_vm.ucode_packages(), [])
+            self.assertEqual(hw_vm.initramfs_modules(), [])
+            self.assertIn("MODULES=()", hw_vm.mkinitcpio_dropin())
+            self.assertEqual(hw_vm.graphics_packages(), ["mesa"])
+
+    def test_group_selection_parser_and_pacman_download_table(self) -> None:
+        self.assertEqual(additional.parse_group_selection("none", 5), [])
+        self.assertEqual(additional.parse_group_selection("", 5), [])
+        self.assertEqual(additional.parse_group_selection("all", 5), [0, 1, 2, 3, 4])
+        self.assertEqual(additional.parse_group_selection("1, 3-4", 5), [0, 2, 3])
+        self.assertIsNone(additional.parse_group_selection("0,9", 5))
+        self.assertIsNone(additional.parse_group_selection("invalid", 5))
+
+        sample_si = """\
+Repository      : extra
+Name            : firefox
+Version         : 136.0-1
+Download Size   : 72.50 MiB
+Installed Size  : 245.00 MiB
+
+Repository      : extra
+Name            : keepassxc
+Version         : 2.7.9-2
+Download Size   : 9728.00 KiB
+Installed Size  : 36.00 MiB
+"""
+        parsed = additional.parse_pacman_si(sample_si)
+        self.assertAlmostEqual(float(parsed["firefox"]["download_mib"]), 72.5, places=1)
+        self.assertAlmostEqual(float(parsed["keepassxc"]["download_mib"]), 9.5, places=1)
+
+        rows = [
+            {
+                "name": "firefox",
+                "repo": "extra",
+                "version": "136.0-1",
+                "download_mib": 72.5,
+                "installed_mib": 245.0,
+                "installed": False,
+            },
+            {
+                "name": "keepassxc",
+                "repo": "extra",
+                "version": "2.7.9-2",
+                "download_mib": 9.5,
+                "installed_mib": 36.0,
+                "installed": True,
+            },
+        ]
+        new_cnt, total_dl, total_inst = ui.render_download_plan(rows)
+        self.assertEqual(new_cnt, 1)
+        self.assertAlmostEqual(total_dl, 72.5, places=1)
+        self.assertAlmostEqual(total_inst, 245.0, places=1)
 
 
 if __name__ == "__main__":
