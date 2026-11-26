@@ -8,17 +8,28 @@ build() {
 
     add_binary /usr/local/lib/systemd/archrelius-askpw
 
+    if [[ -f /etc/archrelius.conf && ! -L /etc/archrelius.conf ]]; then
+        add_file /etc/archrelius.conf
+    fi
+
     printf '%s\n' \
         '[Service]' \
         'ExecStart=' \
         'ExecStart=/usr/local/lib/systemd/archrelius-askpw --watch --console' \
+        'LimitCORE=0' \
+        'IPAddressDeny=any' \
+        'RestrictAddressFamilies=AF_UNIX' \
+        'MemoryDenyWriteExecute=yes' \
+        'LockPersonality=yes' \
+        'RestrictRealtime=yes' \
         | add_systemd_drop_in systemd-ask-password-console.service 10-archrelius
 }
 
 help() {
     cat <<HELPEOF
-This hook installs the centered ARCHRELIUS TUI password agent for sd-encrypt
-inside the initramfs (with automatic fallback to systemd-tty-ask-password-agent).
+This hook installs the hardened, customizable ARCHRELIUS TUI password agent
+(/etc/archrelius.conf) for sd-encrypt inside the initramfs, with automatic
+fallback to systemd-tty-ask-password-agent.
 HELPEOF
 }
 

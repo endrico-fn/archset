@@ -14,16 +14,17 @@ import os
 import time
 from dataclasses import dataclass
 
-import ui
+from . import ui
 
 ESP_SIZE = "1G"
+LARGE_DISK_ESP_THRESHOLD = 64 * 1024**3
 SWAP_SIZE = "4G"
 LUKS_NAME = "root"
 BTRFS_LABEL = "arch"
 MIN_DISK_BYTES = 20 * 1024**3
 
-MOUNT_OPTS = "noatime,compress=zstd:3,ssd,space_cache=v2"
-SWAP_MOUNT_OPTS = "noatime,compress=no,ssd,space_cache=v2"
+MOUNT_OPTS = "noatime,compress=zstd:3,space_cache=v2"
+SWAP_MOUNT_OPTS = "noatime,compress=no,space_cache=v2"
 
 # (subvolume name, mountpoint)
 SUBVOLUMES = [
@@ -32,6 +33,7 @@ SUBVOLUMES = [
     ("@log", "/var/log"),
     ("@pkg", "/var/cache/pacman/pkg"),
     ("@snapshots", "/.snapshots"),
+    ("@home_snapshots", "/home/.snapshots"),
     ("@swap", "/swap"),
 ]
 
@@ -98,6 +100,33 @@ def partitions(disk: str) -> list[str]:
     for node in data.get("blockdevices", []):
         walk(node)
     return result
+
+
+def partition_summary(disk: str) -> str:
+    """Return a concise one-line summary of existing partitions on ``disk``."""
+    data = _lsblk_json(["-b", "-o", "NAME,TYPE,SIZE,FSTYPE,LABEL", disk])
+    entries: list[str] = []
+
+    def walk(node: dict) -> None:
+        if node.get("type") == "part":
+            name = str(node.get("name") or "part")
+            fstype = str(node.get("fstype") or "raw")
+            try:
+                sz = ui.format_bytes(int(node.get("size") or 0))
+            except (TypeError, ValueError):
+                sz = "?"
+            label = str(node.get("label") or "").strip()
+            lbl = f" ({label})" if label else ""
+            entries.append(f"{name}: {fstype} {sz}{lbl}")
+        for child in node.get("children", []) or []:
+            walk(child)
+
+    for node in data.get("blockdevices", []):
+        walk(node)
+    if not entries:
+        return "unpartitioned / empty"
+    joined = ", ".join(entries)
+    return joined if len(joined) <= 64 else joined[:61] + "..."
 
 
 def _source_of(path: str) -> str:
@@ -200,26 +229,74 @@ def wait_for(path: str, timeout: int = 15) -> None:
     raise ui.ArchsetError(f"Device {path} did not appear within {timeout} seconds.")
 
 
+def _zero_head_tail(device: str, *, mib: int = 16) -> None:
+    """Zero the first and last ``mib`` MiB of a block device or partition."""
+    chunk_bytes = mib * 1024 * 1024
+    if ui.DRY_RUN:
+        ui.log.debug(f"DRY-RUN  zero {mib}MiB head/tail on {device}")
+        return
+    try:
+        fd = os.open(device, os.O_WRONLY)
+    except OSError as exc:
+        ui.log.debug(f"zero_head_tail skipped on {device}: {exc}")
+        return
+    zero_buf = b"\x00" * (1024 * 1024)
+    try:
+        for _ in range(mib):
+            os.write(fd, zero_buf)
+        try:
+            end_pos = os.lseek(fd, 0, os.SEEK_END)
+        except OSError:
+            end_pos = 0
+        if end_pos > chunk_bytes:
+            os.lseek(fd, end_pos - chunk_bytes, os.SEEK_SET)
+            for _ in range(mib):
+                os.write(fd, zero_buf)
+        os.fsync(fd)
+    except OSError as exc:
+        ui.log.debug(f"zero_head_tail partial write on {device}: {exc}")
+    finally:
+        os.close(fd)
+
+
 def wipe(disk: str) -> None:
-    ui.warn(f"Wiping all data on {disk}")
+    ui.warn(f"Crypto-erasing and wiping all data on {disk}")
     luks_close()
     for part in partitions(disk):
         ui.run(["umount", "-R", part], check=False)
         ui.run(["swapoff", part], check=False)
+        is_luks = ui.run(
+            ["cryptsetup", "isLuks", part],
+            readonly=True,
+            check=False,
+        )
+        if is_luks.returncode == 0:
+            ui.info(f"Destroying LUKS keyslots on {part} (cryptsetup erase)")
+            ui.run(["cryptsetup", "erase", "--batch-mode", part], check=False)
+        _zero_head_tail(part, mib=16)
         ui.run(["wipefs", "-af", part], check=False)
+    _zero_head_tail(disk, mib=16)
     ui.run(["wipefs", "-af", disk])
     ui.run(["sgdisk", "--zap-all", disk])
+    ui.run(["blkdiscard", "-f", disk], check=False)
+    ui.run(["blockdev", "--flushbufs", disk], check=False)
     ui.run(["partprobe", disk], check=False)
     ui.run(["udevadm", "settle"])
+    ui.run(["sync"], check=False)
 
 
-def partition(disk: str) -> None:
-    ui.info(f"Creating GPT with a {ESP_SIZE} EFI system partition on {disk}")
+def esp_size_for_disk(size_bytes: int) -> str:
+    return "2G" if size_bytes >= LARGE_DISK_ESP_THRESHOLD else ESP_SIZE
+
+
+def partition(disk: str, *, esp_size: str | None = None) -> None:
+    resolved_esp = esp_size or ESP_SIZE
+    ui.info(f"Creating GPT with a {resolved_esp} EFI system partition on {disk}")
     ui.run(
         [
             "sgdisk",
             "--clear",
-            f"--new=1:0:+{ESP_SIZE}",
+            f"--new=1:0:+{resolved_esp}",
             "--typecode=1:ef00",
             "--change-name=1:ESP",
             "--new=2:0:0",
@@ -290,9 +367,12 @@ def luks_open(device: str, name: str, passphrase: str) -> None:
     ui.ok(f"Device mapper active: /dev/mapper/{name}")
 
 
-def luks_close(name: str = LUKS_NAME) -> None:
-    if os.path.exists(f"/dev/mapper/{name}"):
-        ui.run(["cryptsetup", "close", name], check=False)
+def luks_close(name: str = LUKS_NAME, *, strict: bool = False) -> None:
+    mapper = f"/dev/mapper/{name}"
+    if ui.DRY_RUN or os.path.exists(mapper):
+        ui.run(["cryptsetup", "close", name], check=strict)
+    if strict and not ui.DRY_RUN and os.path.exists(mapper):
+        raise ui.ArchsetError(f"Device mapper {mapper} is still active after close.")
 
 
 def mkfs_btrfs(device: str) -> None:
@@ -378,6 +458,14 @@ def normalize_fstab(content: str) -> str:
                 fields[5] = "0"
                 lines.append("\t".join(fields))
                 continue
+            if fstype == "swap":
+                opts = fields[3].split(",")
+                if not any(opt.startswith("pri=") for opt in opts):
+                    opts.append("pri=-2")
+                    fields[3] = ",".join(opts)
+                fields[5] = "0"
+                lines.append("\t".join(fields))
+                continue
         lines.append(line)
     return "\n".join(lines) + "\n"
 
@@ -422,9 +510,31 @@ def partuuid(device: str) -> str:
     return value
 
 
-def unmount_all() -> None:
-    # The swapfile lives inside /mnt/swap; it must be released before unmounting.
+def flush_and_unmount(
+    target_disk: str | None = None,
+    *,
+    strict: bool = True,
+) -> None:
+    """Commit Btrfs CoW transactions, flush VFS & SSD caches, unmount /mnt, and close LUKS."""
+    ui.info("Flushing filesystems and committing all writes to SSD")
+    if ui.DRY_RUN or os.path.ismount("/mnt"):
+        ui.run(["btrfs", "filesystem", "sync", "/mnt"], check=strict)
+    ui.run(["sync"], check=strict)
     ui.run(["swapoff", "/mnt/swap/swapfile"], check=False)
-    ui.run(["umount", "-R", "/mnt"], check=False)
-    luks_close()
+    if ui.DRY_RUN or os.path.ismount("/mnt"):
+        ui.run(["umount", "-R", "/mnt"], check=strict)
+    if strict and not ui.DRY_RUN and os.path.ismount("/mnt"):
+        raise ui.ArchsetError(
+            "/mnt is still mounted; refusing poweroff/reboot to prevent filesystem corruption."
+        )
+    luks_close(strict=strict)
+    if target_disk:
+        ui.run(["blockdev", "--flushbufs", target_disk], check=False)
     ui.run(["udevadm", "settle"], check=False)
+    ui.run(["sync"], check=False)
+    if strict:
+        ui.ok("All filesystems synced, unmounted, and flushed to SSD")
+
+
+def unmount_all() -> None:
+    flush_and_unmount(strict=False)

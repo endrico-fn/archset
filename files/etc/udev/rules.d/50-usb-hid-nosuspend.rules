@@ -1,0 +1,3 @@
+# Managed by archset — keep external USB HID input devices responsive without blocking
+# Intel S0ix / PC10 package C-states on internal USB webcams, Bluetooth, and sensors.
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{bDeviceClass}!="09", ENV{ID_USB_INTERFACES}=="*:03????:*", TEST=="power/control", ATTR{power/control}="on"

@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import getpass
 import os
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -228,27 +229,30 @@ def hr(char: str = "-", width: int = 72) -> None:
 
 
 def render_package_table(title: str, groups: dict[str, list[str]]) -> None:
-    """Render an Arch-ISO TTY-friendly (<= 78 col) grouped package list."""
+    """Render an Arch-ISO TTY-friendly (<= 76 col) grouped package list."""
     print()
-    hr("=")
+    hr("=", 76)
     print(_paint(f"  {title}", _BOLD + _CYAN))
-    hr("-")
+    hr("-", 76)
     total = 0
     for idx, (label, packages) in enumerate(groups.items(), start=1):
         total += len(packages)
-        header = f"  [{idx}] {label} ({len(packages)} pkgs)"
+        header = f"    [ {idx} ] {label} ({len(packages)} pkgs)"
         print(_paint(header, _BOLD))
         wrapped = textwrap.fill(
             ", ".join(packages),
-            width=72,
-            initial_indent="      ",
-            subsequent_indent="      ",
+            width=74,
+            initial_indent="          ",
+            subsequent_indent="          ",
             break_on_hyphens=False,
         )
         print(wrapped)
-    hr("-")
-    print(f"  Total: {total} package(s) across {len(groups)} group(s)")
-    hr("=")
+    hr("-", 76)
+    print(
+        f"    [ a ] Install ALL groups    * [ n ] Skip / None   "
+        f"({total} pkgs across {len(groups)} groups)"
+    )
+    hr("=", 76)
 
 
 def render_download_plan(rows: list[dict[str, object]]) -> tuple[int, float, float]:
@@ -309,6 +313,118 @@ def render_download_plan(rows: list[dict[str, object]]) -> tuple[int, float, flo
     return new_count, total_dl, total_inst
 
 
+def _run_streaming_pipes(
+    argv: list[str],
+    display: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    timeout: int | None,
+    stream_label: str | None,
+) -> tuple[int, str, str]:
+    started = time.monotonic()
+    deadline = (started + timeout) if timeout is not None else None
+    show_live = bool(stream_label and sys.stdout.isatty())
+    last_draw = 0.0
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise CommandError(display, 127, f"executable not found: {argv[0]}") from exc
+
+    assert proc.stdout is not None and proc.stderr is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "STDOUT")
+    sel.register(proc.stderr, selectors.EVENT_READ, "STDERR")
+
+    buffers: dict[str, bytearray] = {"STDOUT": bytearray(), "STDERR": bytearray()}
+    collected: dict[str, list[str]] = {"STDOUT": [], "STDERR": []}
+
+    def _emit_line(tag: str, raw_bytes: bytes) -> None:
+        nonlocal last_draw
+        line = raw_bytes.decode("utf-8", errors="replace").rstrip("\r")
+        collected[tag].append(line)
+        log.debug(f"{tag:<6} | {line[:2000]}")
+        if show_live and line.strip():
+            now_t = time.monotonic()
+            if now_t - last_draw >= 0.12:
+                last_draw = now_t
+                elapsed_s = int(now_t - started)
+                clean_snip = log.redact(line.strip())[:40]
+                status = (
+                    f"\r\033[K{_paint('[*]', _CYAN)} {stream_label} "
+                    f"[{elapsed_s // 60:02d}:{elapsed_s % 60:02d}] {clean_snip}"
+                )
+                sys.stdout.write(status)
+                sys.stdout.flush()
+
+    try:
+        while sel.get_map():
+            wait_sec = 0.25
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.wait()
+                    if show_live:
+                        sys.stdout.write("\r\033[K")
+                        sys.stdout.flush()
+                    raise CommandError(display, 124, f"timed out after {timeout} seconds")
+                if remaining < wait_sec:
+                    wait_sec = remaining
+
+            events = sel.select(timeout=wait_sec)
+            if not events and show_live:
+                now_t = time.monotonic()
+                if now_t - last_draw >= 1.0:
+                    last_draw = now_t
+                    elapsed_s = int(now_t - started)
+                    sys.stdout.write(
+                        f"\r\033[K{_paint('[*]', _CYAN)} {stream_label} "
+                        f"[{elapsed_s // 60:02d}:{elapsed_s % 60:02d}] working..."
+                    )
+                    sys.stdout.flush()
+
+            for key, _mask in events:
+                tag = str(key.data)
+                fileobj = key.fileobj
+                chunk = os.read(fileobj.fileno(), 4096)  # type: ignore[union-attr]
+                if not chunk:
+                    sel.unregister(fileobj)
+                    if buffers[tag]:
+                        _emit_line(tag, bytes(buffers[tag]))
+                        buffers[tag].clear()
+                    continue
+                buffers[tag].extend(chunk)
+                while True:
+                    nl = buffers[tag].find(b"\n")
+                    if nl < 0:
+                        break
+                    raw_line = bytes(buffers[tag][:nl])
+                    del buffers[tag][: nl + 1]
+                    _emit_line(tag, raw_line)
+    finally:
+        sel.close()
+        proc.stdout.close()
+        proc.stderr.close()
+
+    returncode = proc.wait()
+    if show_live:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+    stdout_str = "\n".join(collected["STDOUT"]) + ("\n" if collected["STDOUT"] else "")
+    stderr_str = "\n".join(collected["STDERR"]) + ("\n" if collected["STDERR"] else "")
+    return returncode, stdout_str, stderr_str
+
+
 def run(
     cmd,
     *,
@@ -318,6 +434,7 @@ def run(
     env_extra: dict[str, str] | None = None,
     timeout: int | None = None,
     cwd: str | None = None,
+    stream_label: str | None = None,
 ) -> Result:
     """Run a command, log raw command + output (secrets redacted), and return Result."""
     if isinstance(cmd, (list, tuple)):
@@ -334,48 +451,81 @@ def run(
     log.debug(f"CMD      {display}")
     started = time.monotonic()
 
-    if isinstance(input_data, str):
-        payload: bytes | None = input_data.encode()
-    else:
-        payload = input_data
-
     env = None
     if env_extra:
         env = os.environ.copy()
         env.update(env_extra)
 
-    try:
-        proc = subprocess.run(
+    if input_data is None:
+        returncode, stdout, stderr = _run_streaming_pipes(
             argv,
-            input=payload,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            display,
             cwd=cwd,
             env=env,
             timeout=timeout,
+            stream_label=stream_label,
         )
-    except FileNotFoundError as exc:
-        raise CommandError(display, 127, f"executable not found: {argv[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CommandError(display, 124, f"timed out after {timeout} seconds") from exc
+        elapsed = time.monotonic() - started
+        log.debug(f"EXIT     {returncode} ({elapsed:.1f}s)")
+    else:
+        payload = input_data.encode() if isinstance(input_data, str) else input_data
+        try:
+            proc = subprocess.run(
+                argv,
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            raise CommandError(display, 127, f"executable not found: {argv[0]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CommandError(display, 124, f"timed out after {timeout} seconds") from exc
 
-    elapsed = time.monotonic() - started
-    stdout = proc.stdout.decode(errors="replace")
-    stderr = proc.stderr.decode(errors="replace")
+        elapsed = time.monotonic() - started
+        returncode = proc.returncode
+        stdout = proc.stdout.decode(errors="replace")
+        stderr = proc.stderr.decode(errors="replace")
 
-    log.debug(f"EXIT     {proc.returncode} ({elapsed:.1f}s)")
-    for line in stdout.splitlines():
-        log.debug(f"STDOUT | {line[:2000]}")
-    for line in stderr.splitlines():
-        log.debug(f"STDERR | {line[:2000]}")
+        log.debug(f"EXIT     {returncode} ({elapsed:.1f}s)")
+        for line in stdout.splitlines():
+            log.debug(f"STDOUT | {line[:2000]}")
+        for line in stderr.splitlines():
+            log.debug(f"STDERR | {line[:2000]}")
 
-    if check and proc.returncode != 0:
+    if check and returncode != 0:
         tail = "\n".join(stderr.splitlines()[-15:])
         if not tail:
             tail = "\n".join(stdout.splitlines()[-15:])
-        raise CommandError(display, proc.returncode, log.redact(tail))
+        raise CommandError(display, returncode, log.redact(tail))
 
-    return Result(display, proc.returncode, stdout, stderr)
+    return Result(display, returncode, stdout, stderr)
+
+
+def run_with_retry(
+    cmd,
+    *,
+    attempts: int = 3,
+    delay_sec: float = 3.0,
+    **kwargs,
+) -> Result:
+    """Retry transient CommandErrors (e.g. Arch ISO Wi-Fi mirror hiccups)."""
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
+        try:
+            return run(cmd, **kwargs)
+        except CommandError as exc:
+            if attempt >= total:
+                raise
+            warn(
+                f"Command failed (attempt {attempt}/{total}, exit {exc.returncode}); "
+                f"retrying in {delay_sec:.0f}s..."
+            )
+            if delay_sec > 0 and not DRY_RUN:
+                time.sleep(delay_sec)
+    raise AssertionError("unreachable")
 
 
 def write_text(
@@ -485,6 +635,7 @@ def ask_password(
     *,
     confirm: bool = True,
     min_length: int = 8,
+    allow_colon: bool = False,
 ) -> str:
     while True:
         try:
@@ -494,13 +645,13 @@ def ask_password(
         if len(first) < min_length:
             print(_paint(f"  password must be at least {min_length} characters", _YELLOW))
             continue
-        if ":" in first or any(ord(char) < 32 for char in first):
-            print(
-                _paint(
-                    "  the password cannot contain ':' or control characters",
-                    _YELLOW,
-                )
+        if any(ord(char) < 32 for char in first) or (not allow_colon and ":" in first):
+            msg = (
+                "  the passphrase cannot contain control characters"
+                if allow_colon
+                else "  the password cannot contain ':' or control characters"
             )
+            print(_paint(msg, _YELLOW))
             continue
         if confirm:
             second = getpass.getpass(f"{_paint('?', _CYAN)} confirm {prompt.lower()}: ")
@@ -543,23 +694,60 @@ def confirm_typed(prompt: str, expected: str) -> bool:
     return True
 
 
-def menu(title: str, items: list[str], *, default: int | None = None) -> int:
+def menu(
+    title: str,
+    items: list[str],
+    *,
+    default: int | None = None,
+    subtitles: list[str] | None = None,
+    zero_option: str | None = None,
+) -> int:
+    """Render a unified `[ N ] Option` menu (<= 76 cols).
+
+    When ``zero_option`` is set, `[ 0 ] <zero_option>` is shown as the default
+    continuation entry and returns ``-1`` when chosen.
+    """
     print()
-    print(_paint(title, _BOLD))
+    hr("=", 76)
+    print(_paint(f"  {title}", _BOLD + _CYAN))
+    hr("-", 76)
     for index, item in enumerate(items, start=1):
-        marker = "*" if default is not None and index - 1 == default else " "
-        print(f"  {marker} {index}) {item}")
-    hint = f" [{default + 1}]" if default is not None else ""
+        is_def = zero_option is None and default is not None and index - 1 == default
+        marker = _paint("*", _GREEN + _BOLD) if is_def else " "
+        tag = _paint(f"[ {index} ]", _BOLD + (_GREEN if is_def else _CYAN))
+        print(f"  {marker} {tag} {item}")
+        if subtitles and index - 1 < len(subtitles) and subtitles[index - 1]:
+            print(_paint(f"          └─ {subtitles[index - 1]}", _DIM))
+    if zero_option is not None:
+        hr("-", 76)
+        z_marker = _paint("*", _GREEN + _BOLD)
+        z_tag = _paint("[ 0 ]", _BOLD + _GREEN)
+        print(f"  {z_marker} {z_tag} {zero_option}")
+    hr("=", 76)
+
+    if zero_option is not None:
+        range_lbl = f"0-{len(items)}"
+        hint = " [0]"
+    else:
+        range_lbl = f"1-{len(items)}"
+        hint = f" [{default + 1}]" if default is not None else ""
+
     while True:
         try:
-            raw = input(f"{_paint('?', _CYAN)} select [1-{len(items)}]{hint}: ").strip()
+            raw = input(
+                f"{_paint('?', _CYAN)} Select option [{range_lbl}]{hint}: "
+            ).strip()
         except EOFError as exc:
             raise ArchsetError("Input closed unexpectedly.") from exc
         if not raw:
+            if zero_option is not None:
+                return -1
             if default is not None:
                 return default
-            print(_paint("  please choose a number", _YELLOW))
+            print(_paint("  please choose an option number", _YELLOW))
             continue
+        if zero_option is not None and raw == "0":
+            return -1
         if raw.isdigit() and 1 <= int(raw) <= len(items):
             return int(raw) - 1
         print(_paint("  invalid selection", _YELLOW))

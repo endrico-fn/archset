@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-FILES_DIR = Path(__file__).resolve().parent / "files"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FILES_DIR = PROJECT_ROOT / "files"
+
+DEFAULT_TIMEZONE = "Asia/Jakarta"
+DEFAULT_REGDOM = "ID"
+DEFAULT_SHELL = "/usr/bin/zsh"
 
 NVIM_REPO_URL = "https://github.com/endrico-fn/nvim.git"
 FZF_TAB_REPO_URL = "https://github.com/Aloxaf/fzf-tab.git"
@@ -43,8 +48,13 @@ SYSTEM_STATIC_FILES: list[tuple[str, str, int]] = [
     ("etc/systemd/zram-generator.conf", "/etc/systemd/zram-generator.conf", 0o644),
     ("etc/security/limits.d/10-coredump.conf", "/etc/security/limits.d/10-coredump.conf", 0o644),
     ("etc/audit/rules.d/30-archset.rules", "/etc/audit/rules.d/30-archset.rules", 0o640),
-    ("etc/modprobe.d/usb_powersave.conf", "/etc/modprobe.d/usb_powersave.conf", 0o644),
+    (
+        "etc/udev/rules.d/50-usb-hid-nosuspend.rules",
+        "/etc/udev/rules.d/50-usb-hid-nosuspend.rules",
+        0o644,
+    ),
     ("etc/modprobe.d/blacklist-unused.conf", "/etc/modprobe.d/blacklist-unused.conf", 0o644),
+    ("etc/archrelius.conf", "/etc/archrelius.conf", 0o644),
     ("etc/initcpio/install/sd-archrelius", "/etc/initcpio/install/sd-archrelius", 0o644),
     ("usr/local/src/archrelius-askpw.c", "/usr/local/src/archrelius-askpw.c", 0o644),
     ("usr/local/bin/importwgp", "/usr/local/bin/importwgp", 0o755),
@@ -62,6 +72,11 @@ MODPROBE_AUDIO_HDA = (
     "/etc/modprobe.d/audio_powersave.conf",
     0o644,
 )
+MODPROBE_NVIDIA_BLACKLIST = (
+    "etc/modprobe.d/blacklist-nvidia.conf",
+    "/etc/modprobe.d/blacklist-nvidia.conf",
+    0o644,
+)
 
 ASKPW_SRC_DST = "/usr/local/src/archrelius-askpw.c"
 ASKPW_BIN_DST = "/usr/local/lib/systemd/archrelius-askpw"
@@ -72,11 +87,16 @@ ASKPW_CC_ARGS: list[str] = [
     "-Wall",
     "-Wextra",
     "-Werror",
+    "-Wformat=2",
+    "-Wformat-security",
+    "-fno-plt",
     "-fPIE",
     "-pie",
     "-fstack-protector-strong",
+    "-fstack-clash-protection",
+    "-fcf-protection",
     "-D_FORTIFY_SOURCE=3",
-    "-Wl,-z,relro,-z,now",
+    "-Wl,-O1,-z,relro,-z,now,-z,noexecstack,-z,pack-relative-relocs",
     ASKPW_SRC_DST,
     "-o",
     ASKPW_BIN_DST,
@@ -224,6 +244,10 @@ def file_path(rel_path: str) -> Path:
 
 def load_file(rel_path: str) -> str:
     return file_path(rel_path).read_text(encoding="utf-8")
+
+
+def vconsole_conf(font: str = "default8x16") -> str:
+    return f"KEYMAP=us\nFONT={font}\n"
 
 
 def cmdline_root(luks_uuid: str) -> str:

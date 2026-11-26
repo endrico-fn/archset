@@ -9,9 +9,7 @@ import re
 import shutil
 from pathlib import Path
 
-import hardware
-import patcher
-import ui
+from . import hardware, patcher, ui
 
 BASE_ADDITIONAL_GROUPS: dict[str, list[str]] = {
     "Browsers & Comms": [

@@ -6,3 +6,7 @@ reference/
 *.log
 *.bak
 *.old
+*.o
+archrelius-askpw
+archrelius-anim-demo
+archset-backup-*.tar.gz

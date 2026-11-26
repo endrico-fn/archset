@@ -23,13 +23,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import additional  # noqa: E402
 import archset  # noqa: E402
-import configs  # noqa: E402
-import disk  # noqa: E402
-import hardware  # noqa: E402
-import system  # noqa: E402
-import ui  # noqa: E402
+from src import additional, configs, disk, hardware, system, ui  # noqa: E402
 
 
 class StaticFilesAndBootConfigTests(unittest.TestCase):
@@ -100,9 +95,17 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
         self.assertIn(
             "fib daddr . iif type != { local, broadcast, multicast } counter drop", nft
         )
+        self.assertIn("limit rate 10/minute burst 15 packets accept", nft)
+
+        nm_conf = configs.load_file("etc/NetworkManager/conf.d/nm.conf")
+        self.assertIn("ipv6.method=disabled", nm_conf)
+
+        zram_conf = configs.load_file("etc/systemd/zram-generator.conf")
+        self.assertIn("zram-size = min(ram, 8192)", zram_conf)
+        self.assertIn("swap-priority = 100", zram_conf)
 
         sysctl_conf = configs.load_file("etc/sysctl.d/99-knsfd.conf")
-        self.assertIn("vm.swappiness                                                           = 100", sysctl_conf)
+        self.assertIn("vm.swappiness                                                           = 80", sysctl_conf)
         self.assertIn("kernel.unprivileged_bpf_disabled                                        = 1", sysctl_conf)
         self.assertIn("kernel.yama.ptrace_scope                                                = 1", sysctl_conf)
         self.assertIn("vm.mmap_rnd_bits                                                        = 32", sysctl_conf)
@@ -168,12 +171,15 @@ class StaticFilesAndBootConfigTests(unittest.TestCase):
                 "boot/EFI/Linux/arch-linux.efi",
                 "boot/loader/loader.conf",
                 "etc/snapper/configs/root",
+                "etc/snapper/configs/home",
+                "etc/udev/rules.d/50-usb-hid-nosuspend.rules",
                 "etc/nftables.conf",
                 "etc/sysctl.d/99-knsfd.conf",
                 "etc/sudoers.d/20-umask",
                 "etc/audit/rules.d/30-archset.rules",
                 "etc/security/limits.d/10-coredump.conf",
                 "etc/modprobe.d/blacklist-unused.conf",
+                "etc/archrelius.conf",
                 "etc/initcpio/install/sd-archrelius",
                 "usr/local/src/archrelius-askpw.c",
                 "usr/local/lib/systemd/archrelius-askpw",
@@ -346,6 +352,7 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                     "make_swapfile",
                     "write_fstab",
                     "unmount_all",
+                    "flush_and_unmount",
                 ):
                     stack.enter_context(mock.patch.object(disk, name, side_effect=record(name)))
                 for name in (
@@ -379,6 +386,73 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
             call_order.index("setup_bootloader"),
             "/etc/vconsole.conf must exist before mkinitcpio sd-vconsole runs",
         )
+
+    def test_unified_bracket_menu_and_post_install_chroot_then_poweroff_flush_order(self) -> None:
+        import io
+
+        # 1) Verify [ 1 ] / * [ 2 ] bracket rendering in ui.menu()
+        buf = io.StringIO()
+        with (
+            mock.patch("builtins.input", return_value=""),
+            contextlib.redirect_stdout(buf),
+        ):
+            choice = ui.menu(
+                "Select Action",
+                ["Enter arch-chroot", "Stay in Live ISO", "Poweroff System"],
+                default=2,
+                subtitles=["inspect /mnt", "", "safe USB removal"],
+            )
+        self.assertEqual(choice, 2)
+        rendered = buf.getvalue()
+        self.assertIn("[ 1 ] Enter arch-chroot", rendered)
+        self.assertIn("└─ inspect /mnt", rendered)
+        self.assertIn("* [ 3 ] Poweroff System", rendered)
+
+        # 2) Verify post_install_action: [1] enters arch-chroot BEFORE DNS stub & unmount,
+        #    then [3] finalizes DNS, exports logs, runs 6-stage SSD flush, and returns 'poweroff'
+        events: list[str] = []
+        info = disk.DiskInfo("/dev/nvme0n1", "nvme0n1", 512 * 1024**3, "Samsung", "S1", "nvme")
+        inputs = archset.Inputs("archbox", "alice", "", "", "")
+
+        with (
+            mock.patch.object(ui, "menu", side_effect=[0, 2]),
+            mock.patch.object(archset, "enter_arch_chroot", side_effect=lambda: events.append("chroot")),
+            mock.patch.object(system, "finalize_dns_symlink", side_effect=lambda: events.append("dns_stub")),
+            mock.patch.object(system, "export_logs", side_effect=lambda *_a: events.append("export_logs")),
+            mock.patch.object(disk, "flush_and_unmount", side_effect=lambda *_a, **_kw: events.append("flush_ssd")),
+        ):
+            action = archset.post_install_action(info, inputs, interactive=True)
+
+        self.assertEqual(action, "poweroff")
+        self.assertEqual(events, ["chroot", "dns_stub", "export_logs", "flush_ssd"])
+
+        # 3) Verify 6-stage hardware SSD flush sequence in disk.flush_and_unmount()
+        flush_cmds: list[list[str]] = []
+        prev_dry = ui.DRY_RUN
+        ui.DRY_RUN = True
+        try:
+            with mock.patch.object(
+                ui,
+                "run",
+                side_effect=lambda cmd, **_kw: (flush_cmds.append(list(cmd)) or ui.Result("", 0, "", "")),
+            ):
+                disk.flush_and_unmount("/dev/nvme0n1", strict=True)
+        finally:
+            ui.DRY_RUN = prev_dry
+
+        flat = [" ".join(c) for c in flush_cmds]
+        self.assertIn("btrfs filesystem sync /mnt", flat)
+        self.assertIn("umount -R /mnt", flat)
+        self.assertIn("cryptsetup close root", flat)
+        self.assertIn("blockdev --flushbufs /dev/nvme0n1", flat)
+        self.assertLess(flat.index("btrfs filesystem sync /mnt"), flat.index("umount -R /mnt"))
+        self.assertLess(flat.index("umount -R /mnt"), flat.index("cryptsetup close root"))
+        self.assertLess(flat.index("cryptsetup close root"), flat.index("blockdev --flushbufs /dev/nvme0n1"))
+
+        # 4) Verify poweroff action calls systemctl poweroff
+        with mock.patch.object(subprocess, "run") as mock_sub:
+            archset.execute_power_action("poweroff", dry_run=False)
+            mock_sub.assert_called_once_with(["systemctl", "poweroff"], check=False)
 
     def test_nvim_clone_falls_back_to_sudoedit_lua_on_failure(self) -> None:
         written_paths: list[str] = []
@@ -475,6 +549,11 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                 text_ui = rendered.decode("utf-8", "replace")
                 self.assertIn("Enter passphrase for /dev/nvme0n1p2: ", text_ui)
                 self.assertIn("38;2;100;190;175m", text_ui)
+                # Only the passphrase box itself may draw corner glyphs (no banner corner brackets)
+                self.assertEqual(text_ui.count("┌"), 1)
+                self.assertEqual(text_ui.count("┐"), 1)
+                self.assertEqual(text_ui.count("└"), 1)
+                self.assertEqual(text_ui.count("┘"), 1)
 
                 # Simulate i915drmfb deferred takeover switching console to 170x48
                 fcntl.ioctl(
@@ -483,20 +562,15 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                     struct.pack("HHHH", 48, 170, 1366, 768),
                 )
 
-                # Type partial passphrase, press Tab to switch theme live (must NOT erase buffer!),
-                # wait 1 frame to observe Theme 2/4 toast, then Backspace + Arrow-Left + finish!
-                os.write(master_fd, b"Secr\t")
-                toast_seen = False
-                deadline = time.time() + 1.2
+                # Tab and Shift+Tab must be ignored (single Quantum theme, no theme toast, buffer intact)
+                os.write(master_fd, b"Secr\t\x1b[Z")
                 buf2 = bytearray()
-                while time.time() < deadline:
-                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                end_wait = time.time() + 0.15
+                while time.time() < end_wait:
+                    r, _, _ = select.select([master_fd], [], [], 0.04)
                     if r:
                         buf2.extend(os.read(master_fd, 32768))
-                        if "Theme 2/4: Aurora Stardust" in buf2.decode("utf-8", "replace"):
-                            toast_seen = True
-                            break
-                self.assertTrue(toast_seen, "Tab live theme switch toast did not render")
+                self.assertNotIn("Theme ", buf2.decode("utf-8", "replace"))
 
                 os.write(master_fd, b"X\x7f\x1b[Det#99\n")
                 # Drain PTY output while waiting for socket datagram & process exit
@@ -530,39 +604,567 @@ class InstallOrderAndNeovimTests(unittest.TestCase):
                 recv_sock.close()
                 notify_sock.close()
 
+    @unittest.skipIf(shutil.which("gcc") is None, "gcc not available")
+    def test_archrelius_elf_hardening_and_systemd_dropin_sandbox(self) -> None:
+        src = configs.file_path("usr/local/src/archrelius-askpw.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "archrelius-askpw"
+            cc_cmd = [
+                arg
+                if arg not in (configs.ASKPW_SRC_DST, configs.ASKPW_BIN_DST)
+                else (str(src) if arg == configs.ASKPW_SRC_DST else str(bin_path))
+                for arg in configs.ASKPW_CC_ARGS
+            ]
+            subprocess.run(cc_cmd, check=True)
+
+            notes = subprocess.run(
+                ["readelf", "-n", str(bin_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertIn("IBT", notes, "Missing Intel CET IBT (-fcf-protection)")
+            self.assertIn("SHSTK", notes, "Missing Shadow Stack (-fcf-protection)")
+
+            phdrs = subprocess.run(
+                ["readelf", "-l", str(bin_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertIn("GNU_RELRO", phdrs)
+            for line in phdrs.splitlines():
+                if "GNU_STACK" in line:
+                    self.assertNotIn("RWE", line)
+
+            # Execute sd-archrelius build() in a controlled shell harness
+            hook_path = configs.file_path("etc/initcpio/install/sd-archrelius")
+            conf_file = configs.file_path("etc/archrelius.conf")
+            self.assertTrue(conf_file.is_file(), "Missing default files/etc/archrelius.conf")
+
+            harness = f"""
+            set -euo pipefail
+            added_bins=()
+            added_files=()
+            warning() {{ echo "WARN:$*"; }}
+            add_binary() {{ added_bins+=("$1"); }}
+            add_file() {{ added_files+=("$1"); }}
+            add_systemd_drop_in() {{
+                echo "DROPIN:$1:$2"
+                cat
+            }}
+            source "{hook_path}"
+            build_fn="$(declare -f build)"
+            build_fn="${{build_fn//\\/usr\\/local\\/lib\\/systemd\\/archrelius-askpw/{bin_path}}}"
+            build_fn="${{build_fn//\\/etc\\/archrelius.conf/{conf_file}}}"
+            eval "$build_fn"
+            build
+            printf 'BINS:%s\\n' "${{added_bins[*]}}"
+            printf 'FILES:%s\\n' "${{added_files[*]}}"
+            """
+            res = subprocess.run(
+                ["bash", "-c", harness], capture_output=True, text=True, check=True
+            )
+            self.assertIn(f"FILES:{conf_file}", res.stdout)
+            for directive in (
+                "LimitCORE=0",
+                "IPAddressDeny=any",
+                "RestrictAddressFamilies=AF_UNIX",
+                "MemoryDenyWriteExecute=yes",
+                "LockPersonality=yes",
+                "RestrictRealtime=yes",
+            ):
+                self.assertIn(directive, res.stdout)
+
+    @unittest.skipIf(shutil.which("gcc") is None, "gcc not available")
+    def test_archrelius_real_boot_unlock_scanner_and_access_granted_without_echo_leak(
+        self,
+    ) -> None:
+        src = configs.file_path("usr/local/src/archrelius-askpw.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "archrelius-askpw"
+            ask_dir = Path(tmp) / "ask-password"
+            ask_dir.mkdir()
+            sck_path = ask_dir / "sck.real"
+            sym_sck = ask_dir / "sck.symlink"
+
+            cc_cmd = [
+                arg
+                if arg not in (configs.ASKPW_SRC_DST, configs.ASKPW_BIN_DST)
+                else (str(src) if arg == configs.ASKPW_SRC_DST else str(bin_path))
+                for arg in configs.ASKPW_CC_ARGS
+            ]
+            subprocess.run(cc_cmd, check=True)
+
+            recv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            recv_sock.bind(str(sck_path))
+            recv_sock.settimeout(5.0)
+            sym_sck.symlink_to(sck_path)
+
+            # Symlinked socket must be rejected (never trusted via lstat)
+            (ask_dir / "ask.sym").write_text(
+                f"[Ask]\nPID={os.getpid()}\nSocket={sym_sck}\n"
+                "Id=cryptsetup:/dev/nvme0n1p2\nMessage=Bad symlink:\n",
+                encoding="utf-8",
+            )
+
+            # Simulate real systemd-cryptsetup worker process that unlinks ask.*
+            # immediately upon receiving datagram, runs Argon2id, then exits 0.
+            crypt_worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+
+            ask_file = ask_dir / "ask.0002"
+            ask_file.write_text(
+                f"[Ask]\nPID={crypt_worker.pid}\nSocket={sck_path}\n"
+                "Id=tls:nginx\nMessage=Enter TLS key passphrase:\n",
+                encoding="utf-8",
+            )
+
+            master_fd, slave_fd = pty.openpty()
+            # 4K display size with 8x16 font -> 480x135
+            fcntl.ioctl(
+                slave_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", 135, 480, 3840, 2160),
+            )
+
+            proc = subprocess.Popen(
+                [
+                    str(bin_path),
+                    "--watch",
+                    "--no-intro",
+                    f"--tty={os.ttyname(slave_fd)}",
+                    f"--ask-dir={ask_dir}",
+                ],
+            )
+            try:
+                out = bytearray()
+                deadline = time.time() + 1.5
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                    if r:
+                        out.extend(os.read(master_fd, 65536))
+                        decoded = out.decode("utf-8", "replace")
+                        if "Enter TLS key passphrase:" in decoded:
+                            break
+                decoded = out.decode("utf-8", "replace")
+                self.assertIn("Enter TLS key passphrase:", decoded)
+                self.assertNotIn("/dev/mapper/root", decoded)
+                self.assertIn("\x1b[?7l", decoded)
+                self.assertIn("\x1b[?2026h", decoded)
+
+                # Submit passphrase; immediately unlink ask.0002 just like systemd-cryptsetup
+                # does BEFORE running Argon2id while crypt_worker PID remains alive!
+                os.write(master_fd, b"FirstPass\n")
+                reply = recv_sock.recv(256)
+                self.assertEqual(reply, b"+FirstPass")
+                ask_file.unlink()
+
+                # Inject stray keystrokes during Argon2id — MUST NEVER ECHO, and
+                # "Unlocking volume" MUST remain visible while crypt_worker is alive!
+                os.write(master_fd, b"LeakedDuringArgon2id")
+                argon_out = bytearray()
+                end_window = time.time() + 0.30
+                while time.time() < end_window:
+                    r, _, _ = select.select([master_fd], [], [], 0.04)
+                    if r:
+                        argon_out.extend(os.read(master_fd, 65536))
+
+                argon_txt = argon_out.decode("utf-8", "replace")
+                self.assertIn("Unlocking volume", argon_txt)
+                self.assertNotIn(
+                    "LeakedDuringArgon2id",
+                    argon_txt,
+                    "CRITICAL: Extra keystrokes during Argon2id echoed in plaintext!",
+                )
+
+                # Finish crypt_worker (Argon2id succeeded) -> ACCESS GRANTED must render!
+                crypt_worker.terminate()
+                crypt_worker.wait(timeout=2)
+
+                grant_out = bytearray()
+                deadline = time.time() + 1.5
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_fd], [], [], 0.05)
+                    if r:
+                        grant_out.extend(os.read(master_fd, 65536))
+                        if "ACCESS GRANTED" in grant_out.decode("utf-8", "replace"):
+                            break
+
+                grant_txt = grant_out.decode("utf-8", "replace")
+                self.assertIn("ACCESS GRANTED", grant_txt)
+                self.assertIn("38;2;86;184;141m", grant_txt)
+
+                (ask_dir / "ask.sym").unlink()
+                proc.terminate()
+                while proc.poll() is None:
+                    r, _, _ = select.select([master_fd], [], [], 0.02)
+                    if r:
+                        try:
+                            grant_out.extend(os.read(master_fd, 65536))
+                        except OSError:
+                            break
+                self.assertEqual(proc.wait(timeout=3), 0)
+                self.assertNotIn(
+                    "LeakedDuringArgon2id",
+                    grant_out.decode("utf-8", "replace"),
+                )
+            finally:
+                if crypt_worker.poll() is None:
+                    crypt_worker.kill()
+                    crypt_worker.wait(timeout=2)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                os.close(master_fd)
+                os.close(slave_fd)
+                recv_sock.close()
+
+    @unittest.skipIf(shutil.which("gcc") is None, "gcc not available")
+    def test_archrelius_conf_safe_customization_and_malformed_rejection(self) -> None:
+        src = configs.file_path("usr/local/src/archrelius-askpw.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "archrelius-askpw"
+            ask_dir = Path(tmp) / "ask-password"
+            ask_dir.mkdir()
+            sck_path = ask_dir / "sck.cfg"
+
+            cc_cmd = [
+                arg
+                if arg not in (configs.ASKPW_SRC_DST, configs.ASKPW_BIN_DST)
+                else (str(src) if arg == configs.ASKPW_SRC_DST else str(bin_path))
+                for arg in configs.ASKPW_CC_ARGS
+            ]
+            subprocess.run(cc_cmd, check=True)
+
+            recv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                recv_sock.bind(str(sck_path))
+                recv_sock.settimeout(5.0)
+
+                (ask_dir / "ask.0001").write_text(
+                    f"[Ask]\nPID={os.getpid()}\nSocket={sck_path}\n"
+                    "Id=cryptsetup:/dev/nvme0n1p2\nMessage=Unlock:\n",
+                    encoding="utf-8",
+                )
+
+                # 1) Custom declarative config: custom hex #58a6ff (88;166;255), custom label
+                cfg_ok = Path(tmp) / "custom.conf"
+                cfg_ok.write_text(
+                    "intro = false\n"
+                    "accent_color = #58a6ff\n"
+                    "highlight_color = #a5d6ff\n"
+                    "compact_title = MYVAULT\n",
+                    encoding="utf-8",
+                )
+
+                master_fd, slave_fd = pty.openpty()
+                # Compact viewport (80x24) to verify custom compact_title + custom RGB
+                fcntl.ioctl(
+                    slave_fd,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 80, 640, 384),
+                )
+                proc = subprocess.Popen(
+                    [
+                        str(bin_path),
+                        "--query",
+                        f"--config={cfg_ok}",
+                        f"--tty={os.ttyname(slave_fd)}",
+                        f"--ask-dir={ask_dir}",
+                    ],
+                )
+                try:
+                    out = bytearray()
+                    deadline = time.time() + 1.2
+                    while time.time() < deadline:
+                        r, _, _ = select.select([master_fd], [], [], 0.05)
+                        if r:
+                            out.extend(os.read(master_fd, 32768))
+                            txt = out.decode("utf-8", "replace")
+                            if "MYVAULT" in txt and "Enter passphrase" in txt:
+                                break
+                    txt = out.decode("utf-8", "replace")
+                    self.assertIn("MYVAULT", txt)
+                    self.assertIn("38;2;88;166;255m", txt)
+                    self.assertIn("38;2;165;214;255m", txt)
+                    os.write(master_fd, b"ok\n")
+                    self.assertEqual(recv_sock.recv(64), b"+ok")
+                    self.assertEqual(proc.wait(timeout=3), 0)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    os.close(master_fd)
+                    os.close(slave_fd)
+
+                # 2) Malformed values + symlink config -> rejected safely, falls back to #64beaf (100;190;175)
+                cfg_bad = Path(tmp) / "bad.conf"
+                cfg_bad.write_text(
+                    "theme = 9999\n"
+                    "accent_color = $(reboot)\n"
+                    "compact_title = \x1b[2Jevil\n",
+                    encoding="utf-8",
+                )
+                cfg_sym = Path(tmp) / "sym.conf"
+                cfg_sym.symlink_to(cfg_ok)
+
+                for test_cfg in (cfg_bad, cfg_sym):
+                    master_fd, slave_fd = pty.openpty()
+                    fcntl.ioctl(
+                        slave_fd,
+                        termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 48, 170, 1366, 768),
+                    )
+                    proc = subprocess.Popen(
+                        [
+                            str(bin_path),
+                            "--query",
+                            "--no-intro",
+                            f"--config={test_cfg}",
+                            f"--tty={os.ttyname(slave_fd)}",
+                            f"--ask-dir={ask_dir}",
+                        ],
+                    )
+                    try:
+                        out = bytearray()
+                        deadline = time.time() + 1.2
+                        while time.time() < deadline:
+                            r, _, _ = select.select([master_fd], [], [], 0.05)
+                            if r:
+                                out.extend(os.read(master_fd, 32768))
+                                if "38;2;100;190;175m" in out.decode("utf-8", "replace"):
+                                    break
+                        txt = out.decode("utf-8", "replace")
+                        self.assertIn("38;2;100;190;175m", txt)
+                        self.assertNotIn("MYVAULT", txt)
+                        self.assertNotIn("evil", txt)
+                        os.write(master_fd, b"fallback\n")
+                        self.assertEqual(recv_sock.recv(64), b"+fallback")
+                        self.assertEqual(proc.wait(timeout=3), 0)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                        os.close(master_fd)
+                        os.close(slave_fd)
+            finally:
+                recv_sock.close()
+
+    @unittest.skipIf(shutil.which("gcc") is None, "gcc not available")
+    def test_archrelius_masked_feedback_multivolume_guard_fifo_and_preview(self) -> None:
+        src = configs.file_path("usr/local/src/archrelius-askpw.c")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "archrelius-askpw"
+            ask_dir = Path(tmp) / "ask-password"
+            mapper_dir = Path(tmp) / "mapper"
+            ask_dir.mkdir()
+            mapper_dir.mkdir()
+            # Pre-populate 1 already-unlocked volume (simulating multi-volume LUKS setup)
+            (mapper_dir / "root").write_text("", encoding="utf-8")
+
+            cc_cmd = [
+                arg
+                if arg not in (configs.ASKPW_SRC_DST, configs.ASKPW_BIN_DST)
+                else (str(src) if arg == configs.ASKPW_SRC_DST else str(bin_path))
+                for arg in configs.ASKPW_CC_ARGS
+            ]
+            subprocess.run(cc_cmd, check=True)
+
+            # 1) Preview mode renders HUD, masked password feedback on typing, and exits cleanly on Esc
+            master_p, slave_p = pty.openpty()
+            fcntl.ioctl(slave_p, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 130, 1040, 480))
+            cfg_mask = Path(tmp) / "masked.conf"
+            cfg_mask.write_text("intro = false\npassword_feedback = masked\n", encoding="utf-8")
+
+            proc_p = subprocess.Popen(
+                [
+                    str(bin_path),
+                    "--preview",
+                    f"--config={cfg_mask}",
+                    f"--tty={os.ttyname(slave_p)}",
+                ]
+            )
+            try:
+                preview_buf = bytearray()
+                deadline = time.time() + 1.2
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_p], [], [], 0.05)
+                    if r:
+                        preview_buf.extend(os.read(master_p, 32768))
+                        if "[PREVIEW]" in preview_buf.decode("utf-8", "replace"):
+                            break
+                self.assertIn("[PREVIEW]", preview_buf.decode("utf-8", "replace"))
+
+                # Type 3 chars after raw TTY is ready -> must render 3 bullet masks ('•') without plaintext
+                os.write(master_p, b"abc")
+                typed_buf = bytearray()
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_p], [], [], 0.05)
+                    if r:
+                        typed_buf.extend(os.read(master_p, 32768))
+                        if typed_buf.decode("utf-8", "replace").count("•") >= 3:
+                            break
+                ttxt = typed_buf.decode("utf-8", "replace")
+                self.assertGreaterEqual(ttxt.count("•"), 3)
+                self.assertNotIn("abc", ttxt)
+                os.write(master_p, b"\x1b")
+                self.assertEqual(proc_p.wait(timeout=3), 0)
+            finally:
+                if proc_p.poll() is None:
+                    proc_p.kill()
+                    proc_p.wait(timeout=2)
+                os.close(master_p)
+                os.close(slave_p)
+
+            # 2) Multi-volume LUKS failure (mapper_before == 1, mapper_now == 1 after worker exits)
+            #    MUST NOT render false-positive ACCESS GRANTED!
+            sck_path = ask_dir / "sck.multi"
+            recv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            recv_sock.bind(str(sck_path))
+            recv_sock.settimeout(5.0)
+            worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+
+            ask_f = ask_dir / "ask.second"
+            ask_f.write_text(
+                f"[Ask]\nPID={worker.pid}\nSocket={sck_path}\n"
+                "Id=cryptsetup:/dev/nvme1n1p1\nMessage=Unlock data:\n",
+                encoding="utf-8",
+            )
+
+            master_m, slave_m = pty.openpty()
+            fcntl.ioctl(slave_m, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 130, 1040, 480))
+            proc_m = subprocess.Popen(
+                [
+                    str(bin_path),
+                    "--query",
+                    "--no-intro",
+                    f"--tty={os.ttyname(slave_m)}",
+                    f"--ask-dir={ask_dir}",
+                    f"--mapper-dir={mapper_dir}",
+                ]
+            )
+            try:
+                out_m = bytearray()
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    r, _, _ = select.select([master_m], [], [], 0.05)
+                    if r:
+                        out_m.extend(os.read(master_m, 32768))
+                        if "Enter passphrase for /dev/nvme1n1p1:" in out_m.decode("utf-8", "replace"):
+                            break
+                os.write(master_m, b"WrongPassOnLastTry\n")
+                self.assertEqual(recv_sock.recv(64), b"+WrongPassOnLastTry")
+                ask_f.unlink()
+                # Worker exits WITHOUT adding a 2nd mapper target (still only 1 target 'root')
+                worker.terminate()
+                worker.wait(timeout=2)
+
+                while proc_m.poll() is None:
+                    r, _, _ = select.select([master_m], [], [], 0.03)
+                    if r:
+                        try:
+                            out_m.extend(os.read(master_m, 32768))
+                        except OSError:
+                            break
+                self.assertEqual(proc_m.wait(timeout=3), 0)
+                self.assertNotIn(
+                    "ACCESS GRANTED",
+                    out_m.decode("utf-8", "replace"),
+                    "Must NOT show ACCESS GRANTED when 2nd LUKS volume fails to add a mapper target!",
+                )
+            finally:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.wait(timeout=2)
+                if proc_m.poll() is None:
+                    proc_m.kill()
+                    proc_m.wait(timeout=2)
+                os.close(master_m)
+                os.close(slave_m)
+                recv_sock.close()
+
 
 class HardwareAndAdditionalPlanTests(unittest.TestCase):
-    def test_hardware_detect_adapts_intel_amd_and_vm_profiles(self) -> None:
+    def test_hardware_detect_enforces_strict_intel_only_and_supports_i915_xe_hybrid_hidpi(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            # 1) AMD laptop without Realtek Wi-Fi
+            # 1) AMD system MUST be rejected by strict Intel-only guard
             cpu_amd = base / "cpu_amd"
             cpu_amd.write_text("vendor_id\t: AuthenticAMD\nflags\t\t: fpu sse2\n", encoding="utf-8")
             pci_amd = base / "pci_amd"
             (pci_amd / "0000:03:00.0").mkdir(parents=True)
             (pci_amd / "0000:03:00.0/class").write_text("0x030000\n", encoding="utf-8")
             (pci_amd / "0000:03:00.0/vendor").write_text("0x1002\n", encoding="utf-8")
-            (pci_amd / "0000:02:00.0").mkdir(parents=True)
-            (pci_amd / "0000:02:00.0/class").write_text("0x028000\n", encoding="utf-8")
-            (pci_amd / "0000:02:00.0/vendor").write_text("0x8086\n", encoding="utf-8")
 
             hw_amd = hardware.detect(
                 proc_cpuinfo=cpu_amd,
                 pci_dir=pci_amd,
                 dmi_dir=base / "no_dmi",
                 modules_dir=base / "no_mods",
+                drm_dir=base / "no_drm",
             )
             self.assertEqual(hw_amd.cpu_vendor, "amd")
-            self.assertFalse(hw_amd.is_vm)
-            self.assertFalse(hw_amd.has_rtw88_wifi)
-            self.assertEqual(hw_amd.ucode_packages(), ["amd-ucode"])
-            self.assertEqual(hw_amd.initramfs_modules(), ["amdgpu"])
-            self.assertIn("MODULES=(amdgpu)", hw_amd.mkinitcpio_dropin())
-            self.assertIn("vulkan-radeon", hw_amd.graphics_packages())
-            self.assertNotIn("vulkan-intel", hw_amd.graphics_packages())
-            self.assertEqual(hw_amd.multilib_gpu_packages(), ["lib32-vulkan-radeon"])
+            with self.assertRaises(ui.ArchsetError):
+                hardware.assert_intel_hardware(hw_amd, allow_vm=False)
 
-            # Verify inject_system_configs skips i915.conf and rtw88_powersave.conf on AMD+iwlwifi
+            # 2) Modern Intel Lunar Lake / Xe2 laptop (xe driver + 2.8K HiDPI + rtw89 NOT rtw88 + hybrid NVIDIA)
+            cpu_intel = base / "cpu_intel"
+            cpu_intel.write_text("vendor_id\t: GenuineIntel\nflags\t\t: fpu sse4_2\n", encoding="utf-8")
+            pci_xe = base / "pci_xe"
+            drv_xe = base / "drivers" / "xe"
+            drv_rtw89 = base / "drivers" / "rtw89_8852be"
+            drv_sof = base / "drivers" / "sof-audio-pci-intel-lnl"
+            for d in (drv_xe, drv_rtw89, drv_sof):
+                d.mkdir(parents=True)
+
+            igpu = pci_xe / "0000:00:02.0"
+            igpu.mkdir(parents=True)
+            (igpu / "class").write_text("0x030000\n", encoding="utf-8")
+            (igpu / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (igpu / "driver").symlink_to(drv_xe)
+
+            dgpu = pci_xe / "0000:01:00.0"
+            dgpu.mkdir(parents=True)
+            (dgpu / "class").write_text("0x030200\n", encoding="utf-8")
+            (dgpu / "vendor").write_text("0x10de\n", encoding="utf-8")
+
+            wifi = pci_xe / "0000:02:00.0"
+            wifi.mkdir(parents=True)
+            (wifi / "class").write_text("0x028000\n", encoding="utf-8")
+            (wifi / "vendor").write_text("0x10ec\n", encoding="utf-8")
+            (wifi / "driver").symlink_to(drv_rtw89)
+
+            audio = pci_xe / "0000:00:1f.3"
+            audio.mkdir(parents=True)
+            (audio / "class").write_text("0x040100\n", encoding="utf-8")
+            (audio / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (audio / "driver").symlink_to(drv_sof)
+
+            drm_xe = base / "drm_xe"
+            (drm_xe / "card0-eDP-1").mkdir(parents=True)
+            (drm_xe / "card0-eDP-1/modes").write_text("2880x1800\n1920x1200\n", encoding="utf-8")
+
+            hw_xe = hardware.detect(
+                proc_cpuinfo=cpu_intel,
+                pci_dir=pci_xe,
+                dmi_dir=base / "no_dmi",
+                modules_dir=base / "no_mods",
+                drm_dir=drm_xe,
+            )
+            hardware.assert_intel_hardware(hw_xe, allow_vm=False)
+            self.assertEqual(hw_xe.intel_drm_driver, "xe")
+            self.assertEqual(hw_xe.initramfs_modules(), ["xe"])
+            self.assertIn("MODULES=(xe)", hw_xe.mkinitcpio_dropin())
+            self.assertFalse(hw_xe.has_rtw88_wifi, "rtw89 must not be misdetected as rtw88")
+            self.assertTrue(hw_xe.has_nvidia_dgpu)
+            self.assertTrue(hw_xe.has_sof_audio)
+            self.assertEqual(hw_xe.console_font(), "ter-v32n")
+            self.assertIn("vpl-gpu-rt", hw_xe.graphics_packages())
+            self.assertNotIn("libva-mesa-driver", hw_xe.graphics_packages())
+            self.assertEqual(hw_xe.multilib_gpu_packages(), ["lib32-mesa", "lib32-vulkan-intel"])
+
+            # Verify inject_system_configs skips i915.conf on xe, injects blacklist-nvidia.conf, and skips rtw88
             written_dsts: list[str] = []
             prev_dry = ui.DRY_RUN
             ui.DRY_RUN = True
@@ -573,18 +1175,29 @@ class HardwareAndAdditionalPlanTests(unittest.TestCase):
                     ),
                     mock.patch.object(ui, "patch_file"),
                 ):
-                    system.inject_system_configs(hw_amd, regdom="US")
+                    system.inject_system_configs(hw_xe, regdom="US")
             finally:
                 ui.DRY_RUN = prev_dry
             self.assertNotIn("/etc/modprobe.d/i915.conf", written_dsts)
+            self.assertIn("/etc/modprobe.d/blacklist-nvidia.conf", written_dsts)
             self.assertNotIn("/etc/modprobe.d/rtw88_powersave.conf", written_dsts)
-            phases_us = system.build_install_phases(hw_amd, regdom="US")
+            self.assertIn("/etc/udev/rules.d/50-usb-hid-nosuspend.rules", written_dsts)
+
+            phases_us = system.build_install_phases(hw_xe, regdom="US")
+            self.assertIn("sof-firmware", phases_us["Graphics Drivers & Audio"])
+            self.assertIn("thermald", phases_us["Graphics Drivers & Audio"])
+            self.assertIn("xdg-desktop-portal-kde", phases_us["Desktop Environment (KDE Plasma) & Fonts"])
+            self.assertIn("terminus-font", phases_us["Desktop Environment (KDE Plasma) & Fonts"])
+            self.assertIn(
+                "tesseract-data-eng",
+                phases_us["Terminal, Shell, Core Utilities & Development"],
+            )
             self.assertNotIn(
                 "tesseract-data-ind",
                 phases_us["Terminal, Shell, Core Utilities & Development"],
             )
 
-            # 2) QEMU/KVM Virtual Machine
+            # 3) QEMU/KVM Virtual Machine: rejected unless allow_vm=True
             cpu_vm = base / "cpu_vm"
             cpu_vm.write_text("vendor_id\t: GenuineIntel\nflags\t\t: fpu hypervisor\n", encoding="utf-8")
             dmi_vm = base / "dmi_vm"
@@ -600,12 +1213,202 @@ class HardwareAndAdditionalPlanTests(unittest.TestCase):
                 pci_dir=pci_vm,
                 dmi_dir=dmi_vm,
                 modules_dir=base / "no_mods",
+                drm_dir=base / "no_drm",
             )
             self.assertTrue(hw_vm.is_vm)
+            with self.assertRaises(ui.ArchsetError):
+                hardware.assert_intel_hardware(hw_vm, allow_vm=False)
+            hardware.assert_intel_hardware(hw_vm, allow_vm=True)
             self.assertEqual(hw_vm.ucode_packages(), [])
             self.assertEqual(hw_vm.initramfs_modules(), [])
             self.assertIn("MODULES=()", hw_vm.mkinitcpio_dropin())
             self.assertEqual(hw_vm.graphics_packages(), ["mesa"])
+            self.assertEqual(hw_vm.console_font(), "default8x16")
+
+    def test_select_mirrors_locks_https_singapore_and_indonesia_only(self) -> None:
+        recorded_cmds: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            recorded_cmds.append(list(cmd))
+            return ui.Result(" ".join(cmd), 0, "", "")
+
+        prev_dry = ui.DRY_RUN
+        ui.DRY_RUN = True
+        try:
+            with (
+                mock.patch.object(ui, "run", side_effect=fake_run),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/reflector"),
+                mock.patch.object(system, "_server_count", return_value=5),
+            ):
+                system.select_mirrors("US")
+        finally:
+            ui.DRY_RUN = prev_dry
+
+        reflector_calls = [c for c in recorded_cmds if c and c[0] == "reflector"]
+        self.assertEqual(len(reflector_calls), 1)
+        cmd = reflector_calls[0]
+        self.assertIn("Singapore", cmd)
+        self.assertIn("Indonesia", cmd)
+        self.assertNotIn("Japan", cmd)
+        self.assertIn("https", cmd)
+
+    def test_run_with_retry_and_streaming_capture_and_luks_colon_password(self) -> None:
+        # 1) Streaming subprocess captures real stdout & stderr lines
+        res = ui.run(
+            [sys.executable, "-c", "import sys; print('hello-out'); print('hello-err', file=sys.stderr)"],
+            readonly=True,
+            stream_label="Testing stream",
+        )
+        self.assertIn("hello-out", res.stdout)
+        self.assertIn("hello-err", res.stderr)
+
+        # 2) run_with_retry retries transient CommandError then succeeds
+        attempts = 0
+
+        def flaky(*_a, **_kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise ui.CommandError("pacman -S", 1, "mirror timeout")
+            return ui.Result("pacman -S", 0, "ok", "")
+
+        with mock.patch.object(ui, "run", side_effect=flaky):
+            out = ui.run_with_retry(["pacman", "-S", "neovim"], attempts=3, delay_sec=0.0)
+        self.assertEqual(out.stdout, "ok")
+        self.assertEqual(attempts, 3)
+
+        # 3) ask_password allows ':' for LUKS passphrase when allow_colon=True
+        with mock.patch("getpass.getpass", side_effect=["Vault:Key:2026!", "Vault:Key:2026!"]):
+            pw = ui.ask_password("LUKS2 passphrase", allow_colon=True)
+        self.assertEqual(pw, "Vault:Key:2026!")
+        ui.log.clear_secrets()
+
+    def test_setup_snapper_mounts_root_and_home_snapshots_with_wheel_group(self) -> None:
+        chroot_cmds: list[list[str]] = []
+        host_cmds: list[list[str]] = []
+
+        prev_dry = ui.DRY_RUN
+        ui.DRY_RUN = True
+        try:
+            with (
+                mock.patch.object(
+                    system,
+                    "chroot",
+                    side_effect=lambda cmd, **_kw: (chroot_cmds.append(list(cmd)) or ui.Result("", 0, "", "")),
+                ),
+                mock.patch.object(
+                    ui,
+                    "run",
+                    side_effect=lambda cmd, **_kw: (host_cmds.append(list(cmd)) or ui.Result("", 0, "", "")),
+                ),
+                mock.patch.object(ui, "patch_file"),
+                mock.patch.object(ui, "mkdir"),
+            ):
+                system.setup_snapper()
+        finally:
+            ui.DRY_RUN = prev_dry
+
+        self.assertTrue(
+            any("subvol=@home_snapshots" in " ".join(c) for c in host_cmds),
+            "Expected @home_snapshots mount in setup_snapper()",
+        )
+        self.assertIn(
+            ["chown", "root:wheel", "/.snapshots", "/home/.snapshots"],
+            chroot_cmds,
+        )
+
+    def test_crypto_wipe_efibootmgr_cleanup_and_export_backup_bundle(self) -> None:
+        import tarfile
+        from src import maintenance
+
+        # 1) disk.wipe() destroys LUKS2 keyslots with cryptsetup erase + blkdiscard + flushbufs
+        wipe_cmds: list[list[str]] = []
+
+        def fake_wipe_run(cmd, **_kw):
+            c = list(cmd)
+            wipe_cmds.append(c)
+            if c[:2] == ["cryptsetup", "isLuks"]:
+                rc = 0 if c[-1].endswith("p2") else 1
+                return ui.Result(" ".join(c), rc, "", "")
+            return ui.Result(" ".join(c), 0, "", "")
+
+        prev_dry = ui.DRY_RUN
+        ui.DRY_RUN = True
+        try:
+            with (
+                mock.patch.object(disk, "partitions", return_value=["/dev/nvme0n1p1", "/dev/nvme0n1p2"]),
+                mock.patch.object(ui, "run", side_effect=fake_wipe_run),
+            ):
+                disk.wipe("/dev/nvme0n1")
+        finally:
+            ui.DRY_RUN = prev_dry
+
+        flat_wipe = [" ".join(c) for c in wipe_cmds]
+        self.assertIn("cryptsetup erase --batch-mode /dev/nvme0n1p2", flat_wipe)
+        self.assertNotIn("cryptsetup erase --batch-mode /dev/nvme0n1p1", flat_wipe)
+        self.assertIn("blkdiscard -f /dev/nvme0n1", flat_wipe)
+        self.assertIn("blockdev --flushbufs /dev/nvme0n1", flat_wipe)
+
+        # 2) efibootmgr parser & cleanup removes only Linux Boot Manager / Arch Linux entries
+        sample_efi = (
+            "BootCurrent: 0003\n"
+            "Timeout: 1 seconds\n"
+            "BootOrder: 0001,0003,0000\n"
+            "Boot0000* Windows Boot Manager\tHD(1,GPT,aaa)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)\n"
+            "Boot0001* Linux Boot Manager\tHD(1,GPT,bbb)/File(\\EFI\\systemd\\systemd-bootx64.efi)\n"
+            "Boot0003* UEFI: SanDisk USB\tPciRoot(0x0)/USB(1,0)\n"
+        )
+        entries = maintenance.parse_efibootmgr_entries(sample_efi)
+        self.assertEqual(entries, [("0001", "Linux Boot Manager")])
+
+        efi_cmds: list[list[str]] = []
+
+        def fake_efi_run(cmd, **_kw):
+            c = list(cmd)
+            efi_cmds.append(c)
+            if c == ["efibootmgr"]:
+                return ui.Result("efibootmgr", 0, sample_efi, "")
+            return ui.Result(" ".join(c), 0, "", "")
+
+        prev_dry = ui.DRY_RUN
+        ui.DRY_RUN = True
+        try:
+            with mock.patch.object(ui, "run", side_effect=fake_efi_run):
+                removed = maintenance.cleanup_efi_boot_entries(interactive=False)
+        finally:
+            ui.DRY_RUN = prev_dry
+        self.assertEqual(removed, 1)
+        self.assertIn(["efibootmgr", "-b", "0001", "-B"], efi_cmds)
+
+        # 3) export_backup creates 0600 tar.gz with archrelius.conf, WireGuard profiles & pkglist
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_root = Path(tmp) / "sysroot"
+            out_dir = Path(tmp) / "out"
+            (fake_root / "etc/wireguard/profiles").mkdir(parents=True)
+            (fake_root / "var/lib/importwgp").mkdir(parents=True)
+            (fake_root / "etc/archrelius.conf").write_text("accent_color = #64beaf\n", encoding="utf-8")
+            (fake_root / "etc/wireguard/profiles/sg1.conf").write_text("[Interface]\n", encoding="utf-8")
+            (fake_root / "var/lib/importwgp/index.tsv").write_text("sg1\tSG#1\n", encoding="utf-8")
+
+            with mock.patch.object(
+                ui,
+                "run",
+                return_value=ui.Result("pacman -Qqe", 0, "base\nlinux\nneovim\n", ""),
+            ):
+                bundle = maintenance.export_backup(
+                    dest_dir=out_dir,
+                    root_dir=fake_root,
+                    hostname="intelbox",
+                )
+
+            self.assertTrue(bundle.is_file())
+            self.assertEqual(oct(bundle.stat().st_mode & 0o777), "0o600")
+            with tarfile.open(bundle, "r:gz") as tar:
+                names = set(tar.getnames())
+            self.assertIn("etc/archrelius.conf", names)
+            self.assertIn("etc/wireguard/profiles/sg1.conf", names)
+            self.assertIn("var/lib/importwgp/index.tsv", names)
+            self.assertIn("pkglist-explicit.txt", names)
 
     def test_group_selection_parser_and_pacman_download_table(self) -> None:
         self.assertEqual(additional.parse_group_selection("none", 5), [])

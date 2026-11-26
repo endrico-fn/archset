@@ -26,6 +26,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 import traceback
 import urllib.error
@@ -33,31 +34,38 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import additional
-import disk
-import hardware
-import system
-import ui
+from src import additional, configs, disk, hardware, maintenance, system, ui
 
 TOTAL_STEPS = 12
-DEFAULT_TIMEZONE = "Asia/Jakarta"
-DEFAULT_REGDOM = "ID"
+DEFAULT_TIMEZONE = configs.DEFAULT_TIMEZONE
+DEFAULT_REGDOM = configs.DEFAULT_REGDOM
 _storage_started = False
 
 REQUIRED_TOOLS = [
     "arch-chroot",
+    "blkdiscard",
     "blkid",
+    "blockdev",
+    "btrfs",
     "cryptsetup",
+    "efibootmgr",
     "findmnt",
     "genfstab",
     "lsblk",
     "mkfs.btrfs",
     "mkfs.fat",
+    "mount",
     "pacman",
     "pacstrap",
     "partprobe",
     "sgdisk",
+    "swapoff",
+    "swapon",
+    "sync",
+    "systemctl",
+    "timedatectl",
     "udevadm",
+    "umount",
     "wipefs",
 ]
 
@@ -91,6 +99,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="additional",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Live-ISO decommission mode: crypto-erase target disk (LUKS2 + blkdiscard) and clean UEFI NVRAM entries",
+    )
+    parser.add_argument(
+        "--export-backup",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help="non-destructive: export WireGuard profiles, archrelius.conf, and package list into a 0600 tar.gz bundle",
     )
     parser.add_argument(
         "--yes",
@@ -134,6 +155,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="allow full install outside the Arch ISO (dangerous)",
     )
+    parser.add_argument(
+        "--allow-vm",
+        action="store_true",
+        help="allow running on virtual machine hardware for testing (Intel-only policy override)",
+    )
     parser.add_argument("--version", action="version", version=f"archset {ui.VERSION}")
     return parser.parse_args(argv)
 
@@ -174,18 +200,41 @@ def _regdom_validator(value: str) -> tuple[bool, str]:
     return True, ""
 
 
-def check_network() -> None:
+def _ping_mirror() -> bool:
     url = "https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db"
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             response.read(1)
-    except (urllib.error.URLError, OSError) as exc:
-        raise ui.ArchsetError(
-            "No internet access. Connect to the network and run archset again."
-        ) from exc
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
 
 
-def preflight(args: argparse.Namespace) -> None:
+def check_network(*, interactive: bool = False) -> None:
+    if _ping_mirror():
+        return
+    if (
+        interactive
+        and sys.stdin.isatty()
+        and Path("/run/archiso").exists()
+        and shutil.which("iwctl") is not None
+    ):
+        ui.warn("No internet connection detected on the Arch ISO.")
+        if ui.confirm("Open interactive iwctl now to connect Wi-Fi?", default=True):
+            subprocess.run(["iwctl"], check=False)
+            if _ping_mirror():
+                ui.ok("Internet connection established")
+                return
+    raise ui.ArchsetError(
+        "No internet access. Connect to the network (e.g. iwctl) and run archset again."
+    )
+
+
+def preflight(
+    args: argparse.Namespace,
+    hw: hardware.HardwareProfile | None = None,
+) -> None:
+    profile = hw or hardware.detect()
     if os.geteuid() != 0:
         raise ui.ArchsetError("archset must be run as root.")
     if not Path("/sys/firmware/efi").exists():
@@ -196,6 +245,8 @@ def preflight(args: argparse.Namespace) -> None:
         raise ui.ArchsetError(
             "EFI variables are not available; boot the ISO in UEFI mode."
         )
+
+    hardware.assert_intel_hardware(profile, allow_vm=getattr(args, "allow_vm", False))
 
     missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
     if missing:
@@ -219,12 +270,15 @@ def preflight(args: argparse.Namespace) -> None:
             )
         ui.warn("Running outside the Arch ISO because --force was supplied.")
 
-    ui.run(["timedatectl", "set-ntp", "true"], check=False)
+    check_network(interactive=not args.dry_run)
+    ui.ok(f"Preflight & Intel hardware check passed ({profile.summary()})")
 
-    check_network()
-    system.select_mirrors(args.regdom or DEFAULT_REGDOM)
+
+def prepare_live_iso() -> None:
+    ui.run(["timedatectl", "set-ntp", "true"], check=False)
+    system.select_mirrors()
     system.refresh_iso_keyring()
-    ui.ok("Preflight checks passed")
+    ui.ok("Live ISO NTP, HTTPS mirrors (Singapore & Indonesia), and keyring ready")
 
 
 def collect_inputs(
@@ -282,7 +336,7 @@ def collect_inputs(
     ui.info("Set separate passwords for root, primary user, and LUKS2 encryption.")
     root_password = ui.ask_password("root password")
     user_password = ui.ask_password(f"user '{username}' password")
-    luks_passphrase = ui.ask_password("LUKS2 passphrase (no TPM2)")
+    luks_passphrase = ui.ask_password("LUKS2 passphrase (no TPM2)", allow_colon=True)
 
     additional_packages = additional.prompt_additional_selection(
         interactive=True, hw=profile
@@ -319,13 +373,19 @@ def select_disk(args: argparse.Namespace) -> disk.DiskInfo:
         if not candidates:
             raise ui.ArchsetError("No disk with at least 20 GiB is available.")
         labels = []
+        subtitles = []
         for item in candidates:
             note = " [mounted]" if disk.is_mounted(item.path) else ""
             labels.append(
                 f"{item.path:<14} {ui.format_bytes(item.size):>9}  "
                 f"{item.model or item.name}  [{item.tran or 'unknown'}]{note}"
             )
-        index = ui.menu("Select the disk to erase and install Arch Linux on", labels)
+            subtitles.append(disk.partition_summary(item.path))
+        index = ui.menu(
+            "Select Target Disk (ALL DATA ON SELECTED DISK WILL BE WIPED)",
+            labels,
+            subtitles=subtitles,
+        )
         info = candidates[index]
 
     disk.assert_safe_target(info.path)
@@ -333,24 +393,84 @@ def select_disk(args: argparse.Namespace) -> disk.DiskInfo:
     return info
 
 
+def review_settings(
+    info: disk.DiskInfo,
+    inputs: Inputs,
+    args: argparse.Namespace,
+    hw: hardware.HardwareProfile,
+) -> disk.DiskInfo:
+    """Interactive `[ 1 ]..[ 6 ]` review & edit loop prior to WIPE confirmation."""
+    if not sys.stdin.isatty() or ui.DRY_RUN:
+        return info
+
+    while True:
+        items = [
+            f"Hostname         : {inputs.hostname}",
+            f"Username         : {inputs.username}",
+            f"Region           : {inputs.timezone} (Wi-Fi regdom: {inputs.regdom})",
+            "Credentials      : Configured (separate root, user & LUKS2 passphrases)",
+            f"Additional Apps  : {len(inputs.additional_packages)} package(s) selected",
+            f"Target Disk      : {info.path} ({ui.format_bytes(info.size)} — {info.model or info.name})",
+        ]
+        choice = ui.menu(
+            "Review Configuration (Select number to edit before wiping)",
+            items,
+            zero_option="Continue to Disk Wipe Confirmation",
+        )
+        if choice == -1:
+            return info
+        if choice == 0:
+            inputs.hostname = ui.ask(
+                "Hostname", default=inputs.hostname, validator=_hostname_validator
+            )
+        elif choice == 1:
+            inputs.username = ui.ask(
+                "Username", default=inputs.username, validator=_username_validator
+            )
+        elif choice == 2:
+            inputs.timezone = ui.ask(
+                "Timezone", default=inputs.timezone, validator=_timezone_validator
+            )
+            inputs.regdom = ui.ask(
+                "Wi-Fi regulatory domain (ISO 2-letter)",
+                default=inputs.regdom,
+                validator=_regdom_validator,
+            ).upper()
+        elif choice == 3:
+            inputs.root_password = ui.ask_password("root password")
+            inputs.user_password = ui.ask_password(f"user '{inputs.username}' password")
+            inputs.luks_passphrase = ui.ask_password(
+                "LUKS2 passphrase (no TPM2)", allow_colon=True
+            )
+        elif choice == 4:
+            inputs.additional_packages = additional.prompt_additional_selection(
+                interactive=True, hw=hw
+            )
+        elif choice == 5:
+            disk_args = argparse.Namespace(**vars(args))
+            disk_args.disk = None
+            info = select_disk(disk_args)
+
+
 def confirm_destruction(info: disk.DiskInfo, inputs: Inputs) -> None:
-    ui.hr("=")
+    ui.hr("=", 76)
     ui.warn("DESTRUCTIVE OPERATION: ALL DATA ON THE TARGET DISK WILL BE LOST")
-    ui.hr("=")
+    ui.hr("=", 76)
     print(f"  Device     : {info.path}")
     print(f"  Model      : {info.model or 'unknown'}")
     print(f"  Serial     : {info.serial or 'unknown'}")
-    print(f"  Size       : {ui.format_bytes(info.size)}")
+    print(f"  Size       : {ui.format_bytes(info.size)} (ESP {disk.esp_size_for_disk(info.size)} + LUKS2 Btrfs)")
     print(f"  Hostname   : {inputs.hostname}")
     print(f"  Username   : {inputs.username}")
     print(f"  Region     : {inputs.timezone} (Wi-Fi regdom: {inputs.regdom})")
-    print("  Boot Stack : UEFI + systemd-boot + UKI (sd-encrypt + ARCHRELIUS TUI, no TPM2)")
+    print("  Boot Stack : UEFI + systemd-boot + UKI (sd-encrypt + ARCHRELIUS TUI, Intel-only)")
+    print("  Mirrors    : HTTPS Singapore & Indonesia (reflector)")
     print("  Network    : IPv6 disabled + dnscrypt-proxy + nftables")
     print(f"  Additional : {len(inputs.additional_packages)} optional package(s)")
     print()
-    print("  The disk will be repartitioned, encrypted with LUKS2 and formatted.")
+    print("  The disk will be crypto-erased, repartitioned, encrypted with LUKS2 and formatted.")
     print("  There is no undo.")
-    ui.hr("=")
+    ui.hr("=", 76)
 
     if not ui.confirm_typed("erase the target disk", f"WIPE {info.path}"):
         raise ui.ArchsetError("Destructive operation was not confirmed. Aborting.")
@@ -361,13 +481,73 @@ def confirm_destruction(info: disk.DiskInfo, inputs: Inputs) -> None:
         raise ui.ArchsetError("Installation cancelled by the user.")
 
 
+def enter_arch_chroot() -> None:
+    if ui.DRY_RUN:
+        ui.log.debug(f"DRY-RUN  arch-chroot /mnt {configs.DEFAULT_SHELL}")
+        return
+    subprocess.run(["arch-chroot", "/mnt", configs.DEFAULT_SHELL], check=False)
+
+
+def post_install_action(
+    info: disk.DiskInfo,
+    inputs: Inputs,
+    *,
+    interactive: bool | None = None,
+) -> str:
+    """Present `[ 1 ]..[ 4 ]` post-install menu, keep /mnt live for chroot, then flush SSD."""
+    global _storage_started
+    use_menu = (sys.stdin.isatty() and not ui.DRY_RUN) if interactive is None else interactive
+    action = "stay"
+
+    if use_menu:
+        options = [
+            "Enter arch-chroot   (inspect /mnt with live DNS; 'exit' returns here)",
+            "Stay in Live ISO    (flush SSD, unmount /mnt & close LUKS)",
+            "Poweroff System     (flush SSD, unmount /mnt & close LUKS -> systemctl poweroff)",
+            "Reboot System       (flush SSD, unmount /mnt & close LUKS -> systemctl reboot)",
+        ]
+        while True:
+            choice = ui.menu(
+                "Installation Finished — Select Next Action",
+                options,
+                default=2,
+            )
+            if choice == 0:
+                ui.info(
+                    "Entering interactive arch-chroot /mnt (type 'exit' to return to this menu)"
+                )
+                enter_arch_chroot()
+                continue
+            if choice == 1:
+                action = "stay"
+                break
+            if choice == 2:
+                action = "poweroff"
+                break
+            if choice == 3:
+                action = "reboot"
+                break
+
+    system.finalize_dns_symlink()
+    system.export_logs(ui.log.path, inputs.username)
+    disk.flush_and_unmount(info.path, strict=True)
+    _storage_started = False
+    return action
+
+
+def execute_power_action(action: str, *, dry_run: bool = False) -> None:
+    if dry_run or action not in ("poweroff", "reboot"):
+        return
+    subprocess.run(["systemctl", action], check=False)
+
+
 def install(
     inputs: Inputs,
     info: disk.DiskInfo,
     args: argparse.Namespace,
     *,
     hw: hardware.HardwareProfile | None = None,
-) -> None:
+) -> str:
     global _storage_started
     profile = hw or hardware.detect()
     target = info.path
@@ -381,12 +561,13 @@ def install(
     ui.step(5, TOTAL_STEPS, f"Wiping and partitioning {target}")
     _storage_started = True
     disk.wipe(target)
-    disk.partition(target)
+    disk.partition(target, esp_size=disk.esp_size_for_disk(info.size))
     disk.mkfs_esp(esp)
 
     ui.step(6, TOTAL_STEPS, "Creating LUKS2 container (argon2id) and btrfs subvolumes")
     disk.luks_format(root_part, inputs.luks_passphrase)
     disk.luks_open(root_part, disk.LUKS_NAME, inputs.luks_passphrase)
+    inputs.luks_passphrase = ""
     disk.mkfs_btrfs(mapper)
     disk.create_subvolumes(mapper)
 
@@ -405,8 +586,14 @@ def install(
     system.install_phases(inputs.additional_packages, hw=profile, regdom=regdom)
 
     ui.step(10, TOTAL_STEPS, "Configuring locale, users, snapper, configs and services")
-    system.configure_locale(inputs.hostname, tz)
+    system.configure_locale(
+        inputs.hostname,
+        tz,
+        console_font=profile.console_font(),
+    )
     system.create_user(inputs.username, inputs.user_password, inputs.root_password)
+    inputs.user_password = ""
+    inputs.root_password = ""
     system.setup_snapper()
     system.inject_system_configs(profile, regdom=regdom)
     system.enable_services()
@@ -419,22 +606,26 @@ def install(
     )
     system.setup_bootloader(root_luks_uuid, profile)
 
-    ui.step(12, TOTAL_STEPS, "Applying user dotfiles, finalizing DNS and exporting logs")
+    ui.step(12, TOTAL_STEPS, "Applying user dotfiles, verifying system & finalizing SSD")
     system.inject_user_configs(inputs.username, inputs.hostname)
-    system.finalize_dns_symlink()
     system.verify(inputs.username)
-    system.export_logs(ui.log.path, inputs.username)
-    disk.unmount_all()
-
-    ui.ok("Installation finished successfully")
-    ui.info(f"Raw setup log exported to /home/{inputs.username}/archset/setup.log")
+    ui.ok("Installation verified successfully")
+    ui.info(f"Raw setup log destination: /home/{inputs.username}/archset/setup.log")
     if not inputs.additional_packages:
         ui.info(
-            "Tip: install additional apps anytime after reboot with: "
+            "Tip: install additional apps anytime after boot with: "
             "sudo python3 archset.py --additional"
         )
-    print()
-    print("Remove the installation media and reboot into the new system.")
+
+    action = post_install_action(info, inputs)
+    if action == "stay":
+        print()
+        print("Safe to remove installation media or inspect from the Live ISO shell.")
+    elif action == "poweroff":
+        ui.info("Powering off system now (unplug USB media once powered off)...")
+    elif action == "reboot":
+        ui.info("Rebooting system now...")
+    return action
 
 
 def cleanup() -> None:
@@ -480,6 +671,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"archset: {exc}", file=sys.stderr)
         return 1
 
+    post_action = "stay"
+    prev_dry_run = ui.DRY_RUN
     try:
         try:
             ui.init(log_dir)
@@ -497,7 +690,19 @@ def main(argv: list[str] | None = None) -> int:
             ui.warn("Dry run enabled: no modifying command will be executed.")
 
         try:
-            # Strict non-destructive branch: never touches disk.py or /run/archiso
+            active_modes = sum(
+                [
+                    bool(args.additional),
+                    bool(args.uninstall),
+                    args.export_backup is not None,
+                ]
+            )
+            if active_modes > 1:
+                raise ui.ArchsetError(
+                    "--additional, --uninstall, and --export-backup cannot be combined."
+                )
+
+            # Strict non-destructive branches: never touch disk.py
             if args.additional:
                 return additional.run_standalone(
                     username=args.username,
@@ -505,21 +710,35 @@ def main(argv: list[str] | None = None) -> int:
                     assume_yes=args.yes,
                 )
 
-            hw = hardware.detect()
+            if args.export_backup is not None:
+                dest = args.export_backup if args.export_backup else None
+                maintenance.export_backup(dest_dir=dest, username=args.username)
+                return 0
 
-            ui.step(1, TOTAL_STEPS, "Running preflight checks")
-            preflight(args)
+            if args.uninstall:
+                rc, post_action = maintenance.run_uninstall(
+                    args, select_disk_fn=select_disk
+                )
+                if rc != 0:
+                    return rc
+            else:
+                hw = hardware.detect()
 
-            ui.step(2, TOTAL_STEPS, "Collecting installation settings")
-            inputs = collect_inputs(args, hw)
+                ui.step(1, TOTAL_STEPS, "Running fast preflight & Intel hardware checks")
+                preflight(args, hw)
 
-            ui.step(3, TOTAL_STEPS, "Selecting the target disk")
-            info = select_disk(args)
+                ui.step(2, TOTAL_STEPS, "Collecting installation settings, disk & optional apps")
+                inputs = collect_inputs(args, hw)
+                info = select_disk(args)
 
-            ui.step(4, TOTAL_STEPS, "Confirming the destructive operation")
-            confirm_destruction(info, inputs)
+                ui.step(3, TOTAL_STEPS, "Reviewing configuration & confirming disk wipe")
+                info = review_settings(info, inputs, args, hw)
+                confirm_destruction(info, inputs)
 
-            install(inputs, info, args, hw=hw)
+                ui.step(4, TOTAL_STEPS, "Preparing live ISO (NTP, SG/ID HTTPS mirrors & keyring)")
+                prepare_live_iso()
+
+                post_action = install(inputs, info, args, hw=hw)
         except KeyboardInterrupt:
             ui.error("Installation interrupted by the user.")
             cleanup()
@@ -538,11 +757,13 @@ def main(argv: list[str] | None = None) -> int:
             cleanup()
             return 1
         finally:
+            ui.DRY_RUN = prev_dry_run
             ui.log.clear_secrets()
             ui.log.close()
     finally:
         lock.release()
 
+    execute_power_action(post_action, dry_run=args.dry_run)
     return 0
 
 

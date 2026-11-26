@@ -7,16 +7,12 @@ import os
 import shutil
 from pathlib import Path
 
-import configs
-import disk
-import hardware
-import patcher
-import ui
+from . import configs, disk, hardware, patcher, ui
 
 TARGET = "/mnt"
-TIMEZONE = "Asia/Jakarta"
-DEFAULT_REGDOM = "ID"
-DEFAULT_SHELL = "/usr/bin/zsh"
+TIMEZONE = configs.DEFAULT_TIMEZONE
+DEFAULT_REGDOM = configs.DEFAULT_REGDOM
+DEFAULT_SHELL = configs.DEFAULT_SHELL
 
 # Phase 1: Base OS, kernel, LUKS2, Btrfs, UKI, and recovery/audit essentials
 # (CPU microcode is appended dynamically by base_packages(hw))
@@ -59,6 +55,8 @@ INSTALL_PHASES: dict[str, list[str]] = {
         "intel-media-driver",
         "vulkan-intel",
         "libvpl",
+        "vpl-gpu-rt",
+        "sof-firmware",
         "pipewire",
         "pipewire-alsa",
         "pipewire-jack",
@@ -68,6 +66,7 @@ INSTALL_PHASES: dict[str, list[str]] = {
         "wireplumber",
         "alsa-utils",
         "power-profiles-daemon",
+        "thermald",
         "fwupd",
     ],
     "Desktop Environment (KDE Plasma) & Fonts": [
@@ -91,10 +90,13 @@ INSTALL_PHASES: dict[str, list[str]] = {
         "kdeplasma-addons",
         "breeze-gtk",
         "kde-gtk-config",
+        "xdg-desktop-portal-kde",
+        "xdg-desktop-portal-gtk",
         "noto-fonts",
         "noto-fonts-cjk",
         "ttf-jetbrains-mono-nerd",
         "ttf-sarasa-gothic",
+        "terminus-font",
     ],
     "Terminal, Shell, Core Utilities & Development": [
         "kitty",
@@ -134,6 +136,7 @@ INSTALL_PHASES: dict[str, list[str]] = {
         "bash-completion",
         "smartmontools",
         "xdg-utils",
+        "tesseract-data-eng",
         "tesseract-data-ind",
         "rustup",
         "go",
@@ -159,6 +162,7 @@ def build_install_phases(
 ) -> dict[str, list[str]]:
     profile = hw or hardware.detect()
     audio_and_power = [
+        "sof-firmware",
         "pipewire",
         "pipewire-alsa",
         "pipewire-jack",
@@ -168,6 +172,7 @@ def build_install_phases(
         "wireplumber",
         "alsa-utils",
         "power-profiles-daemon",
+        *([] if profile.is_vm else ["thermald"]),
         "fwupd",
     ]
     dev_pkgs = [
@@ -201,6 +206,7 @@ REQUIRED_SERVICES = [
 OPTIONAL_SERVICES = [
     "bluetooth.service",
     "power-profiles-daemon.service",
+    "thermald.service",
     "systemd-timesyncd.service",
     "systemd-oomd.service",
     "systemd-boot-update.service",
@@ -235,7 +241,12 @@ def pacstrap(packages: list[str], label: str, *, init_keyring: bool = False) -> 
     if init_keyring:
         cmd.append("-K")
     cmd.extend([TARGET, *packages])
-    ui.run(cmd)
+    ui.run_with_retry(
+        cmd,
+        attempts=3,
+        delay_sec=3.0,
+        stream_label=f"pacstrap: {label}",
+    )
 
 
 def _server_count(path: str = "/etc/pacman.d/mirrorlist") -> int:
@@ -246,10 +257,8 @@ def _server_count(path: str = "/etc/pacman.d/mirrorlist") -> int:
     return sum(1 for line in text.splitlines() if line.strip().startswith("Server"))
 
 
-def select_mirrors(regdom: str = DEFAULT_REGDOM) -> None:
-    is_apac = regdom.upper() in ("ID", "SG", "MY", "JP")
-    region_note = "Indonesia, Singapore, Japan" if is_apac else "global HTTPS fastest"
-    ui.info(f"Selecting HTTPS mirrors with reflector ({region_note})")
+def select_mirrors(_regdom: str = DEFAULT_REGDOM) -> None:
+    ui.info("Selecting HTTPS mirrors with reflector (Singapore & Indonesia)")
     ui.run(["systemctl", "stop", "reflector.service"], check=False)
     if shutil.which("reflector") is None:
         ui.warn("reflector is not present in the live environment; installing it")
@@ -259,33 +268,29 @@ def select_mirrors(regdom: str = DEFAULT_REGDOM) -> None:
             ui.warn(
                 f"Could not install reflector; using the existing mirrorlist: {exc}"
             )
-    reflector_cmd = ["reflector"]
-    if is_apac:
-        reflector_cmd.extend(
-            [
-                "--country",
-                "Indonesia",
-                "--country",
-                "Singapore",
-                "--country",
-                "Japan",
-            ]
-        )
-    reflector_cmd.extend(
-        [
-            "--protocol",
-            "https",
-            "--latest",
-            "20",
-            "--sort",
-            "rate",
-            "--save",
-            "/etc/pacman.d/mirrorlist",
-            "--verbose",
-        ]
-    )
+    reflector_cmd = [
+        "reflector",
+        "--country",
+        "Singapore",
+        "--country",
+        "Indonesia",
+        "--protocol",
+        "https",
+        "--latest",
+        "20",
+        "--sort",
+        "rate",
+        "--save",
+        "/etc/pacman.d/mirrorlist",
+        "--verbose",
+    ]
     try:
-        ui.run(reflector_cmd)
+        ui.run_with_retry(
+            reflector_cmd,
+            attempts=2,
+            delay_sec=2.0,
+            stream_label="reflector HTTPS (Singapore, Indonesia)",
+        )
     except ui.CommandError as exc:
         ui.warn(f"reflector failed: {exc}")
     count = _server_count()
@@ -328,16 +333,39 @@ def install_phases(
     hw: hardware.HardwareProfile | None = None,
     regdom: str = DEFAULT_REGDOM,
 ) -> None:
-    chroot(["pacman", "-Sy", "--noconfirm"])
+    ui.run_with_retry(
+        ["arch-chroot", TARGET, "pacman", "-Sy", "--noconfirm"],
+        attempts=3,
+        delay_sec=3.0,
+        stream_label="Syncing chroot package databases",
+    )
     phases = build_install_phases(hw, regdom=regdom)
     for label, packages in phases.items():
         ui.info(f"Installing phase: {label} ({len(packages)} packages)")
-        chroot(["pacman", "-S", "--noconfirm", "--needed", *packages])
+        ui.run_with_retry(
+            ["arch-chroot", TARGET, "pacman", "-S", "--noconfirm", "--needed", *packages],
+            attempts=3,
+            delay_sec=3.0,
+            stream_label=f"Installing {label}",
+        )
     if additional_packages:
         ui.info(
             f"Installing phase: Additional Applications ({len(additional_packages)} packages)"
         )
-        chroot(["pacman", "-S", "--noconfirm", "--needed", *additional_packages])
+        ui.run_with_retry(
+            [
+                "arch-chroot",
+                TARGET,
+                "pacman",
+                "-S",
+                "--noconfirm",
+                "--needed",
+                *additional_packages,
+            ],
+            attempts=3,
+            delay_sec=3.0,
+            stream_label="Installing Additional Applications",
+        )
 
 
 def copy_mirrorlist() -> None:
@@ -355,8 +383,15 @@ def configure_pacman(*, enable_multilib: bool = False) -> None:
     ui.ok(f"pacman.conf patched (Color, ILoveCandy, CheckSpace, VerbosePkgLists, ParallelDownloads{extra})")
 
 
-def configure_locale(hostname: str, timezone: str = TIMEZONE) -> None:
-    ui.info(f"Configuring locale, timezone ({timezone}) and hostname ({hostname})")
+def configure_locale(
+    hostname: str,
+    timezone: str = TIMEZONE,
+    *,
+    console_font: str = "default8x16",
+) -> None:
+    ui.info(
+        f"Configuring locale, timezone ({timezone}), font ({console_font}) and hostname ({hostname})"
+    )
     ui.patch_file(
         target_path("/etc/locale.gen"),
         lambda text: patcher.patch_line(
@@ -365,7 +400,7 @@ def configure_locale(hostname: str, timezone: str = TIMEZONE) -> None:
         default_if_missing=configs.LOCALE_GEN,
     )
     write("/etc/locale.conf", configs.LOCALE_CONF)
-    write("/etc/vconsole.conf", configs.VCONSOLE_CONF)
+    write("/etc/vconsole.conf", configs.vconsole_conf(console_font))
     write("/etc/hostname", f"{hostname}\n")
     write("/etc/hosts", configs.hosts(hostname))
 
@@ -398,44 +433,43 @@ def create_user(username: str, user_password: str, root_password: str) -> None:
 
 
 def setup_snapper() -> None:
-    ui.info("Configuring snapper for root and home with @snapshots subvolume")
-    snapshots_dir = target_path("/.snapshots")
-    ui.run(["umount", snapshots_dir], check=False)
-    if not ui.DRY_RUN:
-        if os.path.ismount(snapshots_dir):
-            raise ui.ArchsetError(
-                f"Failed to unmount {snapshots_dir} before snapper setup."
-            )
-        if os.path.isdir(snapshots_dir):
-            os.rmdir(snapshots_dir)
-
-    chroot(["snapper", "--no-dbus", "-c", "root", "create-config", "/"])
-    chroot(["btrfs", "subvolume", "delete", "/.snapshots"], check=False)
-    ui.mkdir(snapshots_dir)
-
+    ui.info("Configuring snapper for root (@snapshots) and home (@home_snapshots)")
     mapper = f"/dev/mapper/{disk.LUKS_NAME}"
-    ui.run(
-        [
-            "mount",
-            "-o",
-            f"subvol=@snapshots,{disk.MOUNT_OPTS}",
-            mapper,
-            snapshots_dir,
-        ]
+    layout = (
+        ("root", "/", "/.snapshots", "@snapshots"),
+        ("home", "/home", "/home/.snapshots", "@home_snapshots"),
     )
-    chroot(["chmod", "750", "/.snapshots"])
 
-    config_home = target_path("/etc/snapper/configs/home")
-    if ui.DRY_RUN or not os.path.exists(config_home):
-        chroot(["snapper", "--no-dbus", "-c", "home", "create-config", "/home"])
+    for cfg_name, subvol_mnt, snap_rel, btrfs_subvol in layout:
+        snap_host_dir = target_path(snap_rel)
+        ui.run(["umount", snap_host_dir], check=False)
+        if not ui.DRY_RUN:
+            if os.path.ismount(snap_host_dir):
+                raise ui.ArchsetError(
+                    f"Failed to unmount {snap_host_dir} before snapper setup."
+                )
+            if os.path.isdir(snap_host_dir):
+                os.rmdir(snap_host_dir)
 
-    for name in ("root", "home"):
-        ui.patch_file(
-            target_path(f"/etc/snapper/configs/{name}"),
-            patcher.patch_snapper_config,
+        cfg_file = target_path(f"/etc/snapper/configs/{cfg_name}")
+        if ui.DRY_RUN or not os.path.exists(cfg_file):
+            chroot(["snapper", "--no-dbus", "-c", cfg_name, "create-config", subvol_mnt])
+        chroot(["btrfs", "subvolume", "delete", snap_rel], check=False)
+        ui.mkdir(snap_host_dir)
+        ui.run(
+            [
+                "mount",
+                "-o",
+                f"subvol={btrfs_subvol},{disk.MOUNT_OPTS}",
+                mapper,
+                snap_host_dir,
+            ]
         )
+        ui.patch_file(cfg_file, patcher.patch_snapper_config)
 
-    ui.ok("snapper configs patched (root & home)")
+    chroot(["chmod", "0750", "/.snapshots", "/home/.snapshots"])
+    chroot(["chown", "root:wheel", "/.snapshots", "/home/.snapshots"])
+    ui.ok("snapper configs patched (root & home, wheel access enabled)")
 
 
 def enable_services() -> None:
@@ -465,7 +499,7 @@ def inject_system_configs(
     for src_rel, dst_abs, mode in configs.SYSTEM_STATIC_FILES:
         write(dst_abs, configs.load_file(src_rel), mode=mode)
 
-    if "intel" in profile.gpus:
+    if "intel" in profile.gpus and profile.intel_drm_driver == "i915" and not profile.is_vm:
         src_rel, dst_abs, mode = configs.MODPROBE_I915
         write(dst_abs, configs.load_file(src_rel), mode=mode)
     if profile.has_rtw88_wifi:
@@ -474,10 +508,12 @@ def inject_system_configs(
     if profile.has_intel_hda:
         src_rel, dst_abs, mode = configs.MODPROBE_AUDIO_HDA
         write(dst_abs, configs.load_file(src_rel), mode=mode)
-    if "nvidia" in profile.gpus:
+    if profile.has_nvidia_dgpu:
         ui.warn(
-            "NVIDIA GPU detected: kernel lockdown=integrity blocks unsigned out-of-tree DKMS modules."
+            "Hybrid NVIDIA dGPU detected: blacklisting nouveau/nova_core (Intel-only lockdown=integrity policy)."
         )
+        src_rel, dst_abs, mode = configs.MODPROBE_NVIDIA_BLACKLIST
+        write(dst_abs, configs.load_file(src_rel), mode=mode)
 
     # Targeted line-patching on upstream-owned config files (preserving defaults/comments)
     ui.patch_file(
@@ -569,7 +605,7 @@ def setup_bootloader(
     chroot(["strip", "--strip-unneeded", configs.ASKPW_BIN_DST])
     chroot(["chmod", "0755", configs.ASKPW_BIN_DST])
 
-    chroot(["mkinitcpio", "-P"])
+    chroot(["mkinitcpio", "-P"], stream_label="Building UKI images (mkinitcpio -P)")
 
     if not ui.DRY_RUN:
         for leftover in (
@@ -689,12 +725,15 @@ def verify(username: str) -> None:
         target_path("/boot/EFI/Linux/arch-linux.efi"): "default unified kernel image",
         target_path("/boot/loader/loader.conf"): "systemd-boot loader.conf",
         target_path("/etc/snapper/configs/root"): "snapper root config",
+        target_path("/etc/snapper/configs/home"): "snapper home config",
+        target_path("/etc/udev/rules.d/50-usb-hid-nosuspend.rules"): "USB HID nosuspend udev rule",
         target_path("/etc/nftables.conf"): "nftables configuration",
         target_path("/etc/sysctl.d/99-knsfd.conf"): "sysctl hardening config",
         target_path("/etc/sudoers.d/20-umask"): "sudoers 0022 umask override",
         target_path("/etc/audit/rules.d/30-archset.rules"): "auditd security ruleset",
         target_path("/etc/security/limits.d/10-coredump.conf"): "PAM limits core dump disable",
         target_path("/etc/modprobe.d/blacklist-unused.conf"): "unused protocol & FireWire blacklist",
+        target_path("/etc/archrelius.conf"): "archrelius TUI customization config",
         target_path("/etc/initcpio/install/sd-archrelius"): "sd-archrelius mkinitcpio TUI hook",
         target_path(configs.ASKPW_SRC_DST): "archrelius-askpw C source",
         target_path(configs.ASKPW_BIN_DST): "archrelius-askpw compiled binary",

@@ -10,8 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import disk  # noqa: E402
-import patcher  # noqa: E402
+from src import disk, patcher  # noqa: E402
 
 
 class PatcherTests(unittest.TestCase):
@@ -210,7 +209,7 @@ ENCRYPT_METHOD YESCRYPT
         self.assertIn("ENCRYPT_METHOD YESCRYPT", patched)
         self.assertEqual(patched, patcher.patch_login_defs(patched))
 
-    def test_normalize_fstab_sets_boot_passno_2_and_btrfs_0(self) -> None:
+    def test_normalize_fstab_sets_boot_passno_2_btrfs_0_and_swap_priority(self) -> None:
         sample = """\
 # Static filesystem table
 UUID=aaa / btrfs rw,noatime,subvol=/@ 0 1
@@ -221,7 +220,16 @@ UUID=bbb /boot vfat rw,fmask=0177,dmask=0077 0 0
         self.assertIn("# Static filesystem table", out)
         self.assertIn("UUID=aaa\t/\tbtrfs\trw,noatime,subvol=/@\t0\t0", out)
         self.assertIn("UUID=bbb\t/boot\tvfat\trw,fmask=0177,dmask=0077\t0\t2", out)
-        self.assertIn("/swap/swapfile none swap defaults 0 0", out)
+        self.assertIn("/swap/swapfile\tnone\tswap\tdefaults,pri=-2\t0\t0", out)
+        # Idempotent on repeated pass
+        self.assertEqual(out, disk.normalize_fstab(out))
+
+    def test_adaptive_esp_size_and_btrfs_subvolumes_layout(self) -> None:
+        self.assertEqual(disk.esp_size_for_disk(32 * 1024**3), "1G")
+        self.assertEqual(disk.esp_size_for_disk(64 * 1024**3), "2G")
+        self.assertEqual(disk.esp_size_for_disk(512 * 1024**3), "2G")
+        self.assertNotIn("ssd", disk.MOUNT_OPTS)
+        self.assertIn(("@home_snapshots", "/home/.snapshots"), disk.SUBVOLUMES)
 
 
 if __name__ == "__main__":
